@@ -4,6 +4,7 @@
 #include <vector>
 #include "rust/cxx.h"
 #include "column.h"
+#include "stream.h"
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -34,8 +35,11 @@ namespace libcudf_bridge {
         // Get the columns' data types as an FFI Arrow Schema
         void to_arrow_schema(uint8_t *out_schema_ptr) const;
 
-        // Get the columns' data as an FFI Arrow Array
+        // Get the columns' data as an FFI Arrow Array using cuDF's default stream.
         void to_arrow_array(uint8_t *out_array_ptr) const;
+
+        // Get the columns' data as an FFI Arrow Array using the caller-provided stream.
+        void to_arrow_array_on(uint8_t *out_array_ptr, const CudaStream &stream) const;
 
         // Clone this table view
         [[nodiscard]] std::unique_ptr<TableView> clone() const;

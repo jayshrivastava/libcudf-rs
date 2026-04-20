@@ -1,4 +1,5 @@
 use crate::cudf_reference::CuDFRef;
+use crate::stream::CuDFStream;
 use crate::{CuDFColumnView, CuDFError};
 use arrow::array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow::ffi::{from_ffi, FFI_ArrowArray};
@@ -166,6 +167,29 @@ impl CuDFTableView {
                 .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
             self.inner
                 .to_arrow_array(&mut ffi_array as *mut FFI_ArrowArray as *mut u8);
+        }
+
+        let schema = Arc::new(Schema::try_from(&ffi_schema)?);
+        let array_data = unsafe { from_ffi(ffi_array, &ffi_schema)? };
+        let struct_array = StructArray::from(array_data);
+
+        let batch = RecordBatch::try_new(schema, struct_array.columns().to_vec())?;
+
+        Ok(batch)
+    }
+
+    /// Convert the CuDF table to an Arrow RecordBatch using the provided CUDA stream.
+    pub fn to_arrow_host_on(&self, stream: &CuDFStream) -> Result<RecordBatch, CuDFError> {
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        let mut ffi_array = FFI_ArrowArray::empty();
+
+        unsafe {
+            self.inner
+                .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
+            self.inner.to_arrow_array_on(
+                &mut ffi_array as *mut FFI_ArrowArray as *mut u8,
+                stream.inner(),
+            );
         }
 
         let schema = Arc::new(Schema::try_from(&ffi_schema)?);

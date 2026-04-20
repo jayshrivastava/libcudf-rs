@@ -2,6 +2,7 @@
 #include "groupby.h"
 #include "libcudf-sys/src/lib.rs.h"
 
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -11,6 +12,18 @@
 #include "cudf/interop.hpp"
 
 namespace libcudf_bridge {
+    namespace {
+        void to_arrow_array_impl(
+            cudf::table_view const &view,
+            uint8_t *out_array_ptr,
+            rmm::cuda_stream_view stream) {
+            auto device_array_unique = cudf::to_arrow_host(view, stream);
+            auto *out_array = reinterpret_cast<ArrowArray *>(out_array_ptr);
+            *out_array = device_array_unique->array;
+            device_array_unique.release();
+        }
+    } // namespace
+
     // Table implementation
     Table::Table() : inner(nullptr) {
     }
@@ -120,11 +133,14 @@ namespace libcudf_bridge {
         if (!inner) {
             throw std::runtime_error("Cannot convert null table view to arrow array");
         }
-        auto device_array_unique = cudf::to_arrow_host(*this->inner);
-        auto *out_array = reinterpret_cast<ArrowArray *>(out_array_ptr);
-        // Extract just the ArrowArray from the ArrowDeviceArray
-        *out_array = device_array_unique->array;
-        device_array_unique.release();
+        to_arrow_array_impl(*this->inner, out_array_ptr, cudf::get_default_stream());
+    }
+
+    void TableView::to_arrow_array_on(uint8_t *out_array_ptr, const CudaStream &stream) const {
+        if (!inner) {
+            throw std::runtime_error("Cannot convert null table view to arrow array");
+        }
+        to_arrow_array_impl(*this->inner, out_array_ptr, stream.view());
     }
 
     [[nodiscard]] std::unique_ptr<TableView> TableView::clone() const {

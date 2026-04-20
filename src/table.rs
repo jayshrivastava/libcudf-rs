@@ -1,4 +1,5 @@
 use crate::cudf_array::is_cudf_array;
+use crate::stream::CuDFStream;
 use crate::table_view::CuDFTableView;
 use crate::{CuDFColumn, CuDFError};
 use arrow::array::{Array, ArrayData, StructArray};
@@ -154,6 +155,30 @@ impl CuDFTable {
         Ok(Self { inner })
     }
 
+    /// Create a table from an Arrow RecordBatch on the provided CUDA stream.
+    pub fn from_arrow_host_on(batch: RecordBatch, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        for col in batch.columns() {
+            if is_cudf_array(col) {
+                return Err(ArrowError::InvalidArgumentError("Tried to move a RecordBatch from the host to CuDF, but a column was already in CuDF".to_string()))?;
+            }
+        }
+        let schema = batch.schema().as_ref().clone();
+        let struct_array = StructArray::from(batch);
+        let array_data: ArrayData = struct_array.into_data();
+
+        let ffi_array = FFI_ArrowArray::new(&array_data);
+        let ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+
+        let device_array = ArrowDeviceArray::new_cpu().with_array(ffi_array);
+
+        let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
+        let device_array_ptr = &device_array as *const ArrowDeviceArray as *const u8;
+        let inner =
+            unsafe { ffi::table_from_arrow_host_on(schema_ptr, device_array_ptr, stream.inner()) }?;
+
+        Ok(Self { inner })
+    }
+
     /// Get the number of rows in the table
     ///
     /// # Examples
@@ -259,6 +284,22 @@ impl CuDFTable {
             })
             .collect();
         let inner = ffi::concat_table_views(&inner_views)?;
+        Ok(Self { inner })
+    }
+
+    /// Concatenate multiple table views into a single table on the provided CUDA stream.
+    pub fn concat_on(views: Vec<CuDFTableView>, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        // The CuDFTableView need to leave at least until the ffi::concat_table_views operation
+        // has finished.
+        let mut _refs = Vec::with_capacity(views.len());
+        let inner_views: Vec<_> = views
+            .into_iter()
+            .map(|v| {
+                _refs.push(v._ref.clone());
+                v.into_inner()
+            })
+            .collect();
+        let inner = ffi::concat_table_views_on(&inner_views, stream.inner())?;
         Ok(Self { inner })
     }
 }

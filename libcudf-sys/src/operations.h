@@ -5,6 +5,7 @@
 #include "rust/cxx.h"
 #include "table.h"
 #include "column.h"
+#include "stream.h"
 
 // Forward declarations of Arrow C ABI types
 struct ArrowSchema;
@@ -16,13 +17,35 @@ namespace libcudf_bridge {
     std::unique_ptr<Table> apply_boolean_mask(const TableView &table, const ColumnView &boolean_mask);
 
     // Arrow interop - direct cuDF calls
+    // Use cuDF's default stream for Arrow host-to-device conversion.
     std::unique_ptr<Table> table_from_arrow_host(uint8_t const *schema_ptr, uint8_t const *device_array_ptr);
+    // Use the caller-provided stream for Arrow host-to-device conversion.
+    std::unique_ptr<Table> table_from_arrow_host_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *device_array_ptr,
+        const CudaStream &stream);
 
+    // Use cuDF's default stream for Arrow array-to-column conversion.
     std::unique_ptr<Column> column_from_arrow(uint8_t const *schema_ptr, uint8_t const *array_ptr);
+    // Use the caller-provided stream for Arrow array-to-column conversion.
+    std::unique_ptr<Column> column_from_arrow_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *array_ptr,
+        const CudaStream &stream);
 
+    // Use cuDF's default stream for concatenation.
     std::unique_ptr<Table> concat_table_views(rust::Slice<const std::unique_ptr<TableView>> views);
+    // Use the caller-provided stream for concatenation.
+    std::unique_ptr<Table> concat_table_views_on(
+        rust::Slice<const std::unique_ptr<TableView>> views,
+        const CudaStream &stream);
 
+    // Use cuDF's default stream for concatenation.
     std::unique_ptr<Column> concat_column_views(rust::Slice<const std::unique_ptr<ColumnView>> views);
+    // Use the caller-provided stream for concatenation.
+    std::unique_ptr<Column> concat_column_views_on(
+        rust::Slice<const std::unique_ptr<ColumnView>> views,
+        const CudaStream &stream);
 
     // Gather rows from a table based on a gather map (column of indices)
     std::unique_ptr<Table> gather(const TableView &source_table, const ColumnView &gather_map);

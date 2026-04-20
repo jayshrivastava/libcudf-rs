@@ -107,6 +107,12 @@ pub mod ffi {
             requests: &[*const AggregationRequest],
         ) -> Result<UniquePtr<GroupByResult>>;
 
+        fn aggregate_on(
+            self: &GroupBy,
+            requests: &[*const AggregationRequest],
+            stream: &CudaStream,
+        ) -> Result<UniquePtr<GroupByResult>>;
+
         /// Request for groupby aggregation(s) to perform on a column
         ///
         /// The group membership of each value is determined by the corresponding row
@@ -195,6 +201,17 @@ pub mod ffi {
         ///
         /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
         unsafe fn to_arrow_array(self: &TableView, out_array_ptr: *mut u8);
+
+        /// Get the table view data as an FFI ArrowArray using the caller-provided stream.
+        ///
+        /// # Safety
+        ///
+        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
+        unsafe fn to_arrow_array_on(
+            self: &TableView,
+            out_array_ptr: *mut u8,
+            stream: &CudaStream,
+        );
 
         /// Clone this table view
         ///
@@ -298,8 +315,20 @@ pub mod ffi {
         /// Create a table from vertically concatenating TableView together
         fn concat_table_views(views: &[UniquePtr<TableView>]) -> Result<UniquePtr<Table>>;
 
+        /// Create a table from vertically concatenating TableView together on the provided stream
+        fn concat_table_views_on(
+            views: &[UniquePtr<TableView>],
+            stream: &CudaStream,
+        ) -> Result<UniquePtr<Table>>;
+
         /// Create a table from vertically concatenating ColumnView together
         fn concat_column_views(views: &[UniquePtr<ColumnView>]) -> Result<UniquePtr<Column>>;
+
+        /// Create a table from vertically concatenating ColumnView together on the provided stream
+        fn concat_column_views_on(
+            views: &[UniquePtr<ColumnView>],
+            stream: &CudaStream,
+        ) -> Result<UniquePtr<Column>>;
 
         /// Create a TableView from a set of ColumnView pointers (non-owning)
         fn create_table_view_from_column_views(
@@ -575,6 +604,16 @@ pub mod ffi {
             schema_ptr: *const u8,
             device_array_ptr: *const u8,
         ) -> Result<UniquePtr<Table>>;
+        /// Convert an Arrow DeviceArray to a cuDF table on the provided stream
+        ///
+        /// # Safety
+        ///
+        /// Pointers must be valid Arrow C Data Interface structures.
+        unsafe fn table_from_arrow_host_on(
+            schema_ptr: *const u8,
+            device_array_ptr: *const u8,
+            stream: &CudaStream,
+        ) -> Result<UniquePtr<Table>>;
 
         /// Convert an Arrow array to a cuDF column
         ///
@@ -584,6 +623,16 @@ pub mod ffi {
         unsafe fn column_from_arrow(
             schema_ptr: *const u8,
             array_ptr: *const u8,
+        ) -> Result<UniquePtr<Column>>;
+        /// Convert an Arrow array to a cuDF column on the provided stream
+        ///
+        /// # Safety
+        ///
+        /// Pointers must be valid Arrow C Data Interface structures.
+        unsafe fn column_from_arrow_on(
+            schema_ptr: *const u8,
+            array_ptr: *const u8,
+            stream: &CudaStream,
         ) -> Result<UniquePtr<Column>>;
 
         /// Cast a column to a different data type using GPU-native cudf::cast

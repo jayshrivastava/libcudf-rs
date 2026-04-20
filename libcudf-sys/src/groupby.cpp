@@ -4,8 +4,45 @@
 #include <cudf/table/table.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/aggregation.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 namespace libcudf_bridge {
+    namespace {
+        std::unique_ptr<GroupByResult> aggregate_impl(
+            cudf::groupby::groupby &groupby,
+            rust::Slice<const AggregationRequest * const> requests,
+            rmm::cuda_stream_view stream) {
+            std::vector<cudf::groupby::aggregation_request> cudf_requests;
+            cudf_requests.reserve(requests.size());
+            for (auto *req: requests) {
+                cudf::groupby::aggregation_request cudf_req;
+                cudf_req.values = req->inner->values;
+                for (auto &agg: req->inner->aggregations) {
+                    auto cloned = agg->clone();
+                    auto *groupby_agg = dynamic_cast<cudf::groupby_aggregation *>(cloned.release());
+                    cudf_req.aggregations.push_back(std::unique_ptr<cudf::groupby_aggregation>(groupby_agg));
+                }
+                cudf_requests.push_back(std::move(cudf_req));
+            }
+
+            auto aggregate_result = groupby.aggregate(cudf_requests, stream);
+
+            auto group_by_result = std::make_unique<GroupByResult>();
+            group_by_result->keys.inner = std::move(aggregate_result.first);
+
+            for (auto &cudf_agg_result: aggregate_result.second) {
+                auto result = std::vector<Column>();
+                result.reserve(cudf_agg_result.results.size());
+                for (auto &col: cudf_agg_result.results) {
+                    result.emplace_back(column_from_unique_ptr(std::move(col)));
+                }
+                group_by_result->results.emplace_back(std::move(result));
+            }
+
+            return group_by_result;
+        }
+    } // namespace
+
     // ColumnVectorHelper implementation
     ColumnVectorHelper::ColumnVectorHelper() = default;
 
@@ -38,36 +75,14 @@ namespace libcudf_bridge {
 
     GroupBy::~GroupBy() = default;
 
-    // TODO: this is big, there are clones... I'm not sure if this is right.
     std::unique_ptr<GroupByResult> GroupBy::aggregate(rust::Slice<const AggregationRequest * const> requests) const {
-        std::vector<cudf::groupby::aggregation_request> cudf_requests;
-        cudf_requests.reserve(requests.size());
-        for (auto *req: requests) {
-            cudf::groupby::aggregation_request cudf_req;
-            cudf_req.values = req->inner->values;
-            for (auto &agg: req->inner->aggregations) {
-                auto cloned = agg->clone();
-                auto *groupby_agg = dynamic_cast<cudf::groupby_aggregation *>(cloned.release());
-                cudf_req.aggregations.push_back(std::unique_ptr<cudf::groupby_aggregation>(groupby_agg));
-            }
-            cudf_requests.push_back(std::move(cudf_req));
-        }
+        return aggregate_impl(*inner, requests, cudf::get_default_stream());
+    }
 
-        auto aggregate_result = inner->aggregate(cudf_requests);
-
-        auto group_by_result = std::make_unique<GroupByResult>();
-        group_by_result->keys.inner = std::move(aggregate_result.first);
-
-        for (auto &cudf_agg_result: aggregate_result.second) {
-            auto result = std::vector<Column>();
-            result.reserve(cudf_agg_result.results.size());
-            for (auto &col: cudf_agg_result.results) {
-                result.emplace_back(column_from_unique_ptr(std::move(col)));
-            }
-            group_by_result->results.emplace_back(std::move(result));
-        }
-
-        return group_by_result;
+    std::unique_ptr<GroupByResult> GroupBy::aggregate_on(
+        rust::Slice<const AggregationRequest * const> requests,
+        const CudaStream &stream) const {
+        return aggregate_impl(*inner, requests, stream.view());
     }
 
     // AggregationRequest implementation

@@ -1,5 +1,6 @@
 use crate::cudf_reference::CuDFRef;
 use crate::errors::Result;
+use crate::stream::CuDFStream;
 use crate::table_view::CuDFTableView;
 use crate::{CuDFColumn, CuDFColumnView, CuDFTable};
 use cxx::UniquePtr;
@@ -51,6 +52,38 @@ impl CuDFGroupBy {
             })
             .collect::<Vec<_>>();
         let mut gby_result = self.inner.aggregate(&requests)?;
+        let keys = gby_result.pin_mut().release_keys();
+        let keys = CuDFTable::from_ptr(keys);
+
+        let mut results = Vec::with_capacity(gby_result.len());
+        for i in 0..gby_result.len() {
+            let mut released_result = gby_result.pin_mut().release_result(i);
+            let mut cols = Vec::with_capacity(released_result.len());
+            for j in 0..released_result.len() {
+                let col = released_result.pin_mut().release(j);
+                cols.push(CuDFColumn::new(col));
+            }
+
+            results.push(cols)
+        }
+        Ok((keys, results))
+    }
+
+    /// Perform aggregations on the grouped data on the provided CUDA stream.
+    pub fn aggregate_on(
+        &self,
+        requests: &[AggregationRequest],
+        stream: &CuDFStream,
+    ) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)> {
+        let mut _refs = Vec::with_capacity(requests.len());
+        let requests = requests
+            .iter()
+            .map(|x| {
+                _refs.push(x._ref.clone());
+                x.inner.as_ptr()
+            })
+            .collect::<Vec<_>>();
+        let mut gby_result = self.inner.aggregate_on(&requests, stream.inner())?;
         let keys = gby_result.pin_mut().release_keys();
         let keys = CuDFTable::from_ptr(keys);
 

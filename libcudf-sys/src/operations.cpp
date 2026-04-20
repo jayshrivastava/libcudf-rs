@@ -7,6 +7,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/interop.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 #include <cudf/version_config.hpp>
 
@@ -19,6 +20,62 @@
 #include <sstream>
 
 namespace libcudf_bridge {
+    namespace {
+        std::unique_ptr<Table> concat_table_views_impl(
+            rust::Slice<const std::unique_ptr<TableView>> views,
+            rmm::cuda_stream_view stream) {
+            std::vector<cudf::table_view> table_views;
+            table_views.reserve(views.size());
+
+            for (auto &col: views) {
+                table_views.push_back(std::move(*col->inner));
+            }
+
+            auto table = std::make_unique<Table>();
+            table->inner = cudf::concatenate(table_views, stream);
+            return table;
+        }
+
+        std::unique_ptr<Column> concat_column_views_impl(
+            rust::Slice<const std::unique_ptr<ColumnView>> views,
+            rmm::cuda_stream_view stream) {
+            std::vector<cudf::column_view> column_views;
+            column_views.reserve(views.size());
+
+            for (auto &col: views) {
+                column_views.push_back(std::move(*col->inner));
+            }
+
+            auto column = std::make_unique<Column>();
+            column->inner = cudf::concatenate(column_views, stream);
+            return column;
+        }
+
+        std::unique_ptr<Table> table_from_arrow_host_impl(
+            uint8_t const *schema_ptr,
+            uint8_t const *device_array_ptr,
+            rmm::cuda_stream_view stream) {
+            auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+            auto *device_array = reinterpret_cast<const ArrowDeviceArray *>(device_array_ptr);
+
+            auto result = std::make_unique<Table>();
+            result->inner = cudf::from_arrow_host(schema, device_array, stream);
+            return result;
+        }
+
+        std::unique_ptr<Column> column_from_arrow_impl(
+            uint8_t const *schema_ptr,
+            uint8_t const *array_ptr,
+            rmm::cuda_stream_view stream) {
+            auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+            auto *array = reinterpret_cast<const ArrowArray *>(array_ptr);
+
+            auto result = std::make_unique<Column>();
+            result->inner = cudf::from_arrow_column(schema, array, stream);
+            return result;
+        }
+    } // namespace
+
     // Factory functions
     std::unique_ptr<Table> create_empty_table() {
         auto table = std::make_unique<Table>();
@@ -42,31 +99,23 @@ namespace libcudf_bridge {
     }
 
     std::unique_ptr<Table> concat_table_views(rust::Slice<const std::unique_ptr<TableView>> views) {
-        std::vector<cudf::table_view> table_views;
-        table_views.reserve(views.size());
+        return concat_table_views_impl(views, cudf::get_default_stream());
+    }
 
-        // Take ownership of tables by moving out of each unique pointer
-        for (auto &col: views) {
-            table_views.push_back(std::move(*col->inner));
-        }
-
-        auto table = std::make_unique<Table>();
-        table->inner = cudf::concatenate(table_views);
-        return table;
+    std::unique_ptr<Table> concat_table_views_on(
+        rust::Slice<const std::unique_ptr<TableView>> views,
+        const CudaStream &stream) {
+        return concat_table_views_impl(views, stream.view());
     }
 
     std::unique_ptr<Column> concat_column_views(rust::Slice<const std::unique_ptr<ColumnView>> views) {
-        std::vector<cudf::column_view> table_views;
-        table_views.reserve(views.size());
+        return concat_column_views_impl(views, cudf::get_default_stream());
+    }
 
-        // Take ownership of columns by moving out of each unique pointer
-        for (auto &col: views) {
-            table_views.push_back(std::move(*col->inner));
-        }
-
-        auto table = std::make_unique<Column>();
-        table->inner = cudf::concatenate(table_views);
-        return table;
+    std::unique_ptr<Column> concat_column_views_on(
+        rust::Slice<const std::unique_ptr<ColumnView>> views,
+        const CudaStream &stream) {
+        return concat_column_views_impl(views, stream.view());
     }
 
     // Direct cuDF operations - 1:1 mappings
@@ -143,21 +192,25 @@ namespace libcudf_bridge {
 
     // Arrow interop - convert Arrow data to cuDF table
     std::unique_ptr<Table> table_from_arrow_host(uint8_t const *schema_ptr, uint8_t const *device_array_ptr) {
-        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
-        auto *device_array = reinterpret_cast<const ArrowDeviceArray *>(device_array_ptr);
+        return table_from_arrow_host_impl(schema_ptr, device_array_ptr, cudf::get_default_stream());
+    }
 
-        auto result = std::make_unique<Table>();
-        result->inner = cudf::from_arrow_host(schema, device_array);
-        return result;
+    std::unique_ptr<Table> table_from_arrow_host_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *device_array_ptr,
+        const CudaStream &stream) {
+        return table_from_arrow_host_impl(schema_ptr, device_array_ptr, stream.view());
     }
 
     // Arrow interop - convert Arrow array to cuDF column
     std::unique_ptr<Column> column_from_arrow(uint8_t const *schema_ptr, uint8_t const *array_ptr) {
-        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
-        auto *array = reinterpret_cast<const ArrowArray *>(array_ptr);
+        return column_from_arrow_impl(schema_ptr, array_ptr, cudf::get_default_stream());
+    }
 
-        auto result = std::make_unique<Column>();
-        result->inner = cudf::from_arrow_column(schema, array);
-        return result;
+    std::unique_ptr<Column> column_from_arrow_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *array_ptr,
+        const CudaStream &stream) {
+        return column_from_arrow_impl(schema_ptr, array_ptr, stream.view());
     }
 } // namespace libcudf_bridge
