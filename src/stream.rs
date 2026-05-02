@@ -21,9 +21,14 @@ impl From<CuDFStreamFlags> for u32 {
     }
 }
 
-/// Owning Rust wrapper for an opaque CUDA stream handle.
+/// Owning Rust wrapper for a CUDA stream used by cuDF operations.
 ///
-/// The actual stream lifetime is managed by the underlying C++ `rmm::cuda_stream`.
+/// This type owns an opaque C++ `rmm::cuda_stream`. Dropping `CuDFStream`
+/// destroys that underlying stream.
+///
+/// The handle may be shared across host threads. Work enqueued onto the same
+/// stream executes in order; sharing the handle does not by itself synchronize
+/// access to GPU memory used by those operations.
 pub struct CuDFStream {
     inner: UniquePtr<libcudf_sys::ffi::CudaStream>,
 }
