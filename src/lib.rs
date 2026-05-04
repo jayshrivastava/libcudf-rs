@@ -44,7 +44,7 @@ pub use device_pool::DevicePoolConfig;
 pub use errors::{CuDFError, Result};
 pub use group_by::*;
 pub use join::{cross_join, full_join, inner_join, left_anti_join, left_join, left_semi_join};
-pub use operations::{apply_boolean_mask, cast, gather, slice_column};
+pub use operations::{apply_boolean_mask, cast, cast_on, gather, slice_column};
 pub use pinned_pool::PinnedPoolConfig;
 pub use scalar::CuDFScalar;
 pub use sort::{sort, sort_by_all, stable_sorted_order, SortOrder};

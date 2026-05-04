@@ -1,5 +1,7 @@
 use crate::expr::expr_to_cudf_expr;
+use crate::task_context::{cuda_streams_enabled, CuDFTaskContext};
 use arrow_schema::Schema;
+use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionMapping;
@@ -30,6 +32,7 @@ pub(crate) use op::CuDFAggregationOp;
 #[derive(Debug)]
 pub struct CuDFAggregateExec {
     input: Arc<dyn ExecutionPlan>,
+    segment_id: usize,
     mode: AggregateMode,
     group_by: PhysicalGroupBy,
     aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
@@ -40,6 +43,16 @@ pub struct CuDFAggregateExec {
 impl CuDFAggregateExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
+        mode: AggregateMode,
+        group_by: PhysicalGroupBy,
+        aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
+    ) -> Result<Self> {
+        Self::try_new_with_segment_id(input, 0, mode, group_by, aggr_expr)
+    }
+
+    pub fn try_new_with_segment_id(
+        input: Arc<dyn ExecutionPlan>,
+        segment_id: usize,
         mode: AggregateMode,
         group_by: PhysicalGroupBy,
         aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
@@ -96,11 +109,27 @@ impl CuDFAggregateExec {
 
         Ok(Self {
             input,
+            segment_id,
             mode,
             group_by,
             aggr_expr,
             plan_properties,
         })
+    }
+
+    pub fn segment_id(&self) -> usize {
+        self.segment_id
+    }
+
+    pub(crate) fn with_segment_id(&self, segment_id: usize) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            segment_id,
+            mode: self.mode,
+            group_by: self.group_by.clone(),
+            aggr_expr: self.aggr_expr.clone(),
+            plan_properties: self.plan_properties.clone(),
+        }
     }
 }
 
@@ -152,7 +181,8 @@ impl ExecutionPlan for CuDFAggregateExec {
             self.mode,
             self.group_by.clone(),
             self.aggr_expr.clone(),
-        )?;
+        )?
+        .with_segment_id(self.segment_id);
 
         Ok(Arc::new(new))
     }
@@ -162,13 +192,25 @@ impl ExecutionPlan for CuDFAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
+        let input = self.input.execute(partition, Arc::clone(&context))?;
+        let cuda_stream = if cuda_streams_enabled(&context) {
+            let cudf_ctx = CuDFTaskContext::from_ctx(&context)?;
+            Some(cudf_ctx.stream(self.segment_id, partition).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "CUDA stream not assigned for cuDF segment {} partition {}",
+                    self.segment_id, partition
+                ))
+            })?)
+        } else {
+            None
+        };
         let stream = stream::Stream::new(
             input,
             self.schema(),
             self.mode,
             self.group_by.clone(),
             self.aggr_expr.clone(),
+            cuda_stream,
         )?;
         Ok(Box::pin(stream))
     }
@@ -234,12 +276,15 @@ mod test {
     use crate::aggregate::CuDFAggregateExec;
     use crate::assert_snapshot;
     use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
+    use crate::{CuDFConfig, CuDFExt};
     use arrow::array::record_batch;
     use arrow::util::pretty::pretty_format_batches;
     use arrow_schema::SchemaRef;
     use datafusion::common::ScalarValue;
+    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::prelude::SessionConfig;
     use datafusion_expr::AggregateUDF;
     use datafusion_physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
     use datafusion_physical_plan::expressions::{col, Literal};
@@ -247,6 +292,7 @@ mod test {
     use datafusion_physical_plan::ExecutionPlan;
     use datafusion_physical_plan::PhysicalExpr;
     use futures_util::TryStreamExt;
+    use std::collections::HashMap;
     use std::error::Error;
     use std::sync::Arc;
 
@@ -260,6 +306,15 @@ mod test {
         agg_fn: Arc<AggregateUDF>,
         build_args: impl FnOnce(&SchemaRef) -> datafusion::error::Result<Vec<Arc<dyn PhysicalExpr>>>,
         agg_alias: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        run_group_by_test_with_cuda_streams(agg_fn, build_args, agg_alias, false).await
+    }
+
+    async fn run_group_by_test_with_cuda_streams(
+        agg_fn: Arc<AggregateUDF>,
+        build_args: impl FnOnce(&SchemaRef) -> datafusion::error::Result<Vec<Arc<dyn PhysicalExpr>>>,
+        agg_alias: &str,
+        cuda_streams: bool,
     ) -> Result<String, Box<dyn Error>> {
         let batch = record_batch!(
             ("a", Int64, [1, 4, 3]),
@@ -294,7 +349,16 @@ mod test {
 
         let unload = CuDFUnloadExec::new(Arc::new(aggregate));
 
-        let task = Arc::new(TaskContext::default());
+        let task = if cuda_streams {
+            let mut cudf_config = CuDFConfig::default();
+            cudf_config.cuda_streams = true;
+            Arc::new(
+                make_task_context(SessionConfig::new().with_option_extension(cudf_config))
+                    .with_cudf_task_context(),
+            )
+        } else {
+            Arc::new(TaskContext::default())
+        };
 
         let result = unload.execute(0, task)?;
         let batches = result.try_collect::<Vec<_>>().await?;
@@ -303,11 +367,41 @@ mod test {
         Ok(output)
     }
 
+    fn make_task_context(config: SessionConfig) -> TaskContext {
+        TaskContext::new(
+            Some("task_id".to_string()),
+            "session_id".to_string(),
+            config,
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            Arc::new(RuntimeEnv::default()),
+        )
+    }
+
     #[tokio::test]
     async fn test_group_by_sum() -> Result<(), Box<dyn Error>> {
         let output = run_group_by_test(sum(), |s| Ok(vec![col("a", s)?]), "SUM(a)").await?;
 
         // Note: cuDF's SUM always returns Int64 for integer inputs
+        assert_snapshot!(output, @r"
+        +-------+--------+
+        | c     | SUM(a) |
+        +-------+--------+
+        | world | 9      |
+        | hello | 15     |
+        +-------+--------+
+        ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_group_by_sum_cuda_streams_enabled() -> Result<(), Box<dyn Error>> {
+        let output =
+            run_group_by_test_with_cuda_streams(sum(), |s| Ok(vec![col("a", s)?]), "SUM(a)", true)
+                .await?;
+
         assert_snapshot!(output, @r"
         +-------+--------+
         | c     | SUM(a) |
@@ -410,9 +504,13 @@ mod test {
 /// keep ORDER BY and use `assert_batches_approx_eq` to absorb last-ULP differences.
 #[cfg(test)]
 mod integration {
+    use crate::aggregate::CuDFAggregateExec;
     use crate::assert_snapshot;
+    use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
     use crate::test_utils::{check_query_results, sort_batches, TestFramework};
     use arrow::array::{Array, Float64Array, RecordBatch};
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion_physical_plan::ExecutionPlan;
     use std::error::Error;
 
     /// Absorbs last-ULP differences between cuDF and DataFusion float arithmetic.
@@ -638,6 +736,50 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn test_multi_partition_count_cuda_streams() -> Result<(), Box<dyn Error>> {
+        let sql = r#"SELECT "RainToday", COUNT(*) as n FROM weather GROUP BY "RainToday""#;
+        let gpu_tf = TestFramework::new().await;
+        let cpu_tf = TestFramework::new().await;
+
+        let gpu = gpu_tf
+            .execute(&format!(
+                "SET cudf.enable=true; SET cudf.cuda_streams=true; SET datafusion.execution.target_partitions=4; {sql}"
+            ))
+            .await?;
+        let cpu = cpu_tf
+            .execute(&format!(
+                "SET datafusion.execution.target_partitions=4; {sql}"
+            ))
+            .await?;
+
+        let gpu_pp = pretty_format_batches(&sort_batches(&gpu.batches))?.to_string();
+        let cpu_pp = pretty_format_batches(&sort_batches(&cpu.batches))?.to_string();
+        assert_eq!(gpu_pp, cpu_pp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_repartitioned_aggregate_segments_are_distinct() -> Result<(), Box<dyn Error>> {
+        let sql =
+            r#"SELECT "RainToday", SUM("Rainfall") as total FROM weather GROUP BY "RainToday""#;
+        let tf = TestFramework::new().await;
+        let plan = tf
+            .plan(&format!(
+                "SET cudf.enable=true; SET datafusion.execution.target_partitions=4; {sql}"
+            ))
+            .await?;
+
+        let mut segments = PlanSegments::default();
+        collect_plan_segments(plan.plan.as_ref(), &mut segments);
+        segments.sort_dedup();
+
+        assert_eq!(segments.loads, vec![0, 1]);
+        assert_eq!(segments.aggregates, vec![0, 1]);
+        assert_eq!(segments.unloads, vec![0, 1]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_multi_partition_count_star() -> Result<(), Box<dyn Error>> {
         let sql = r#"SELECT "RainToday", COUNT(*) as n FROM weather GROUP BY "RainToday""#;
         let result = check_query_results(sql, 4).await?;
@@ -706,5 +848,38 @@ mod integration {
         );
         assert_eq!(cpu.pretty_print, gpu.pretty_print);
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct PlanSegments {
+        loads: Vec<usize>,
+        aggregates: Vec<usize>,
+        unloads: Vec<usize>,
+    }
+
+    impl PlanSegments {
+        fn sort_dedup(&mut self) {
+            self.loads.sort_unstable();
+            self.loads.dedup();
+            self.aggregates.sort_unstable();
+            self.aggregates.dedup();
+            self.unloads.sort_unstable();
+            self.unloads.dedup();
+        }
+    }
+
+    fn collect_plan_segments(plan: &dyn ExecutionPlan, segments: &mut PlanSegments) {
+        if let Some(load) = plan.as_any().downcast_ref::<CuDFLoadExec>() {
+            segments.loads.push(load.segment_id());
+        }
+        if let Some(aggregate) = plan.as_any().downcast_ref::<CuDFAggregateExec>() {
+            segments.aggregates.push(aggregate.segment_id());
+        }
+        if let Some(unload) = plan.as_any().downcast_ref::<CuDFUnloadExec>() {
+            segments.unloads.push(unload.segment_id());
+        }
+        for child in plan.children() {
+            collect_plan_segments(child.as_ref(), segments);
+        }
     }
 }

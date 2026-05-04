@@ -8,7 +8,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_physical_plan::{execute_stream, ExecutionPlan};
 use futures_util::TryStreamExt;
 use libcudf_datafusion::aggregate::{avg, count, max, min, sum};
-use libcudf_datafusion::{configure_default_pools, CuDFConfig, HostToCuDFRule};
+use libcudf_datafusion::{configure_default_pools, CuDFConfig, CuDFExt, HostToCuDFRule};
+use std::env;
 use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -41,20 +42,24 @@ fn make_batches(n: usize) -> Vec<RecordBatch> {
 
 async fn cpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
     let schema = schema();
-    let ctx = SessionContext::new();
+    let config = SessionConfig::new().with_target_partitions(target_partitions());
+    let ctx = SessionContext::new_with_config(config);
     ctx.register_table(
         "t",
-        Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        Arc::new(MemTable::try_new(schema, partition_batches(batches)).unwrap()),
     )
     .unwrap();
     ctx
 }
 
-async fn gpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
+async fn gpu_ctx(batches: Vec<RecordBatch>, cuda_streams: bool) -> SessionContext {
     let schema = schema();
     let mut cudf_config = CuDFConfig::default();
     cudf_config.enable = true;
-    let config = SessionConfig::new().with_option_extension(cudf_config);
+    cudf_config.cuda_streams = cuda_streams;
+    let config = SessionConfig::new()
+        .with_target_partitions(target_partitions())
+        .with_option_extension(cudf_config);
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
@@ -68,10 +73,34 @@ async fn gpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
     ctx.register_udaf((*sum()).clone());
     ctx.register_table(
         "t",
-        Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        Arc::new(MemTable::try_new(schema, partition_batches(batches)).unwrap()),
     )
     .unwrap();
     ctx
+}
+
+fn partition_batches(batches: Vec<RecordBatch>) -> Vec<Vec<RecordBatch>> {
+    let partitions = input_partitions();
+    let mut partitioned = vec![Vec::new(); partitions];
+    for (idx, batch) in batches.into_iter().enumerate() {
+        partitioned[idx % partitions].push(batch);
+    }
+    partitioned
+}
+
+fn target_partitions() -> usize {
+    env::var("CUDF_BENCH_TARGET_PARTITIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| SessionConfig::new().target_partitions())
+}
+
+fn input_partitions() -> usize {
+    env::var("CUDF_BENCH_INPUT_PARTITIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(target_partitions)
 }
 
 async fn build_plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
@@ -93,29 +122,49 @@ fn bench_group(c: &mut Criterion, group_name: &str, sql: &str) {
 
         let batches = make_batches(n);
         let cpu = rt.block_on(cpu_ctx(batches.clone()));
-        let gpu = rt.block_on(gpu_ctx(batches));
-
-        let cpu_task_ctx = cpu.task_ctx();
-        let gpu_task_ctx = gpu.task_ctx();
+        let gpu_streams_off = rt.block_on(gpu_ctx(batches.clone(), false));
+        let gpu_streams_on = rt.block_on(gpu_ctx(batches, true));
 
         group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
             b.iter_batched(
-                || rt.block_on(build_plan(&cpu, sql)),
-                |plan| {
+                || (rt.block_on(build_plan(&cpu, sql)), cpu.task_ctx()),
+                |(plan, task_ctx)| {
                     rt.block_on(async {
-                        let stream = execute_stream(plan, cpu_task_ctx.clone()).unwrap();
+                        let stream = execute_stream(plan, task_ctx).unwrap();
                         black_box(stream.try_collect::<Vec<_>>().await.unwrap());
                     })
                 },
                 BatchSize::PerIteration,
             );
         });
-        group.bench_with_input(BenchmarkId::new("gpu", n), &n, |b, _| {
+        group.bench_with_input(BenchmarkId::new("gpu_streams_off", n), &n, |b, _| {
             b.iter_batched(
-                || rt.block_on(build_plan(&gpu, sql)),
-                |plan| {
+                || {
+                    (
+                        rt.block_on(build_plan(&gpu_streams_off, sql)),
+                        gpu_streams_off.task_ctx(),
+                    )
+                },
+                |(plan, task_ctx)| {
                     rt.block_on(async {
-                        let stream = execute_stream(plan, gpu_task_ctx.clone()).unwrap();
+                        let stream = execute_stream(plan, task_ctx).unwrap();
+                        black_box(stream.try_collect::<Vec<_>>().await.unwrap());
+                    })
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("gpu_streams_on", n), &n, |b, _| {
+            b.iter_batched(
+                || {
+                    (
+                        rt.block_on(build_plan(&gpu_streams_on, sql)),
+                        Arc::new(gpu_streams_on.task_ctx().with_cudf_task_context()),
+                    )
+                },
+                |(plan, task_ctx)| {
+                    rt.block_on(async {
+                        let stream = execute_stream(plan, task_ctx).unwrap();
                         black_box(stream.try_collect::<Vec<_>>().await.unwrap());
                     })
                 },

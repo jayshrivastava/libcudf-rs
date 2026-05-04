@@ -1,4 +1,6 @@
 use crate::errors::cudf_to_df;
+use crate::optimizer::CuDFConfig;
+use crate::task_context::{cuda_streams_enabled, CuDFTaskContext};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::{exec_err, plan_err, ScalarValue};
@@ -16,19 +18,43 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct CuDFLoadExec {
     input: Arc<dyn ExecutionPlan>,
+    segment_id: usize,
 
     properties: PlanProperties,
 }
 
 impl CuDFLoadExec {
     pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self, DataFusionError> {
+        Self::try_new_with_segment_id(input, 0)
+    }
+
+    pub fn try_new_with_segment_id(
+        input: Arc<dyn ExecutionPlan>,
+        segment_id: usize,
+    ) -> Result<Self, DataFusionError> {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(cudf_schema_compatibility_map(input.schema())),
             input.properties().partitioning.clone(),
             input.properties().emission_type,
             input.properties().boundedness,
         );
-        Ok(Self { input, properties })
+        Ok(Self {
+            input,
+            segment_id,
+            properties,
+        })
+    }
+
+    pub fn segment_id(&self) -> usize {
+        self.segment_id
+    }
+
+    pub(crate) fn with_segment_id(&self, segment_id: usize) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            segment_id,
+            properties: self.properties.clone(),
+        }
     }
 }
 
@@ -70,7 +96,10 @@ impl ExecutionPlan for CuDFLoadExec {
             );
         }
         let input = Arc::clone(&children[0]);
-        Ok(Arc::new(Self::try_new(input)?))
+        Ok(Arc::new(Self::try_new_with_segment_id(
+            input,
+            self.segment_id,
+        )?))
     }
 
     fn execute(
@@ -78,6 +107,21 @@ impl ExecutionPlan for CuDFLoadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let cuda_stream = if cuda_streams_enabled(&context) {
+            let cudf_cfg = CuDFConfig::from_config_options(context.session_config().options())?;
+            let cudf_ctx = CuDFTaskContext::from_ctx(&context)?;
+            let stream = cudf_ctx
+                .stream(self.segment_id, partition)
+                .unwrap_or_else(|| {
+                    let stream = cudf_cfg.stream_source().allocate();
+                    cudf_ctx.set_stream(self.segment_id, partition, Arc::clone(&stream));
+                    stream
+                });
+            Some(stream)
+        } else {
+            None
+        };
+
         let host_stream = self.input.execute(partition, context)?;
         let target_schema = self.schema();
 
@@ -93,7 +137,10 @@ impl ExecutionPlan for CuDFLoadExec {
                 );
             }
             let schema = batch.schema();
-            let table = CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?;
+            let table = match cuda_stream.as_deref() {
+                Some(stream) => CuDFTable::from_arrow_host_on(batch, stream).map_err(cudf_to_df)?,
+                None => CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?,
+            };
             let cudf_cols: Vec<Arc<dyn Array>> = table
                 .into_columns()
                 .into_iter()

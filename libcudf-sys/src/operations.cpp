@@ -55,6 +55,21 @@ namespace libcudf_bridge {
         return table;
     }
 
+    std::unique_ptr<Table> concat_table_views_on(
+        rust::Slice<const std::unique_ptr<TableView>> views,
+        const CudaStream &stream) {
+        std::vector<cudf::table_view> table_views;
+        table_views.reserve(views.size());
+
+        for (auto &col: views) {
+            table_views.push_back(std::move(*col->inner));
+        }
+
+        auto table = std::make_unique<Table>();
+        table->inner = cudf::concatenate(table_views, stream.view());
+        return table;
+    }
+
     std::unique_ptr<Column> concat_column_views(rust::Slice<const std::unique_ptr<ColumnView>> views) {
         std::vector<cudf::column_view> table_views;
         table_views.reserve(views.size());
@@ -66,6 +81,21 @@ namespace libcudf_bridge {
 
         auto table = std::make_unique<Column>();
         table->inner = cudf::concatenate(table_views);
+        return table;
+    }
+
+    std::unique_ptr<Column> concat_column_views_on(
+        rust::Slice<const std::unique_ptr<ColumnView>> views,
+        const CudaStream &stream) {
+        std::vector<cudf::column_view> table_views;
+        table_views.reserve(views.size());
+
+        for (auto &col: views) {
+            table_views.push_back(std::move(*col->inner));
+        }
+
+        auto table = std::make_unique<Column>();
+        table->inner = cudf::concatenate(table_views, stream.view());
         return table;
     }
 
@@ -151,6 +181,18 @@ namespace libcudf_bridge {
         return result;
     }
 
+    std::unique_ptr<Table> table_from_arrow_host_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *device_array_ptr,
+        const CudaStream &stream) {
+        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+        auto *device_array = reinterpret_cast<const ArrowDeviceArray *>(device_array_ptr);
+
+        auto result = std::make_unique<Table>();
+        result->inner = cudf::from_arrow_host(schema, device_array, stream.view());
+        return result;
+    }
+
     // Arrow interop - convert Arrow array to cuDF column
     std::unique_ptr<Column> column_from_arrow(uint8_t const *schema_ptr, uint8_t const *array_ptr) {
         auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
@@ -158,6 +200,18 @@ namespace libcudf_bridge {
 
         auto result = std::make_unique<Column>();
         result->inner = cudf::from_arrow_column(schema, array);
+        return result;
+    }
+
+    std::unique_ptr<Column> column_from_arrow_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *array_ptr,
+        const CudaStream &stream) {
+        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+        auto *array = reinterpret_cast<const ArrowArray *>(array_ptr);
+
+        auto result = std::make_unique<Column>();
+        result->inner = cudf::from_arrow_column(schema, array, stream.view());
         return result;
     }
 } // namespace libcudf_bridge

@@ -1,6 +1,6 @@
 use crate::cudf_array::is_cudf_array;
 use crate::table_view::CuDFTableView;
-use crate::{CuDFColumn, CuDFError};
+use crate::{CuDFColumn, CuDFError, CuDFStream};
 use arrow::array::{Array, ArrayData, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
@@ -133,6 +133,18 @@ impl CuDFTable {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn from_arrow_host(batch: RecordBatch) -> Result<Self, CuDFError> {
+        Self::from_arrow_host_with_stream(batch, None)
+    }
+
+    /// Create a table from an Arrow RecordBatch using an explicit CUDA stream.
+    pub fn from_arrow_host_on(batch: RecordBatch, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        Self::from_arrow_host_with_stream(batch, Some(stream))
+    }
+
+    fn from_arrow_host_with_stream(
+        batch: RecordBatch,
+        stream: Option<&CuDFStream>,
+    ) -> Result<Self, CuDFError> {
         for col in batch.columns() {
             if is_cudf_array(col) {
                 return Err(ArrowError::InvalidArgumentError("Tried to move a RecordBatch from the host to CuDF, but a column was already in CuDF".to_string()))?;
@@ -149,7 +161,12 @@ impl CuDFTable {
 
         let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
         let device_array_ptr = &device_array as *const ArrowDeviceArray as *const u8;
-        let inner = unsafe { ffi::table_from_arrow_host(schema_ptr, device_array_ptr) }?;
+        let inner = match stream {
+            Some(stream) => unsafe {
+                ffi::table_from_arrow_host_on(schema_ptr, device_array_ptr, stream.inner())
+            }?,
+            None => unsafe { ffi::table_from_arrow_host(schema_ptr, device_array_ptr) }?,
+        };
 
         Ok(Self { inner })
     }
@@ -248,6 +265,18 @@ impl CuDFTable {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn concat(views: Vec<CuDFTableView>) -> Result<Self, CuDFError> {
+        Self::concat_with_stream(views, None)
+    }
+
+    /// Concatenate multiple table views into a single table using an explicit CUDA stream.
+    pub fn concat_on(views: Vec<CuDFTableView>, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        Self::concat_with_stream(views, Some(stream))
+    }
+
+    fn concat_with_stream(
+        views: Vec<CuDFTableView>,
+        stream: Option<&CuDFStream>,
+    ) -> Result<Self, CuDFError> {
         // The CuDFTableView need to leave at least until the ffi::concat_table_views operation
         // has finished.
         let mut _refs = Vec::with_capacity(views.len());
@@ -258,7 +287,10 @@ impl CuDFTable {
                 v.into_inner()
             })
             .collect();
-        let inner = ffi::concat_table_views(&inner_views)?;
+        let inner = match stream {
+            Some(stream) => ffi::concat_table_views_on(&inner_views, stream.inner())?,
+            None => ffi::concat_table_views(&inner_views)?,
+        };
         Ok(Self { inner })
     }
 }
@@ -272,6 +304,7 @@ impl Default for CuDFTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CuDFStreamFlags;
     use arrow::array::*;
     use arrow::datatypes::*;
 
@@ -380,6 +413,30 @@ mod tests {
                 original_col.data_type()
             );
         }
+    }
+
+    #[test]
+    fn test_arrow_roundtrip_simple_on_stream() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = CuDFStream::with_flags(CuDFStreamFlags::NonBlocking);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )?;
+
+        let table = CuDFTable::from_arrow_host_on(batch.clone(), &stream)?;
+        let result = table.into_view().to_arrow_host_on(&stream)?;
+
+        assert_eq!(result.num_rows(), batch.num_rows());
+        assert_eq!(result.column(0).as_ref(), batch.column(0).as_ref());
+        assert_eq!(result.column(1).as_ref(), batch.column(1).as_ref());
+        Ok(())
     }
 
     #[test]

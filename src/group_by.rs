@@ -1,7 +1,7 @@
 use crate::cudf_reference::CuDFRef;
 use crate::errors::Result;
 use crate::table_view::CuDFTableView;
-use crate::{CuDFColumn, CuDFColumnView, CuDFTable};
+use crate::{CuDFColumn, CuDFColumnView, CuDFStream, CuDFTable};
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
     self, aggregation_request_create, make_count_aggregation_groupby, make_max_aggregation_groupby,
@@ -42,6 +42,23 @@ impl CuDFGroupBy {
         &self,
         requests: &[AggregationRequest],
     ) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)> {
+        self.aggregate_with_stream(requests, None)
+    }
+
+    /// Perform aggregations on the grouped data using an explicit CUDA stream.
+    pub fn aggregate_on(
+        &self,
+        requests: &[AggregationRequest],
+        stream: &CuDFStream,
+    ) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)> {
+        self.aggregate_with_stream(requests, Some(stream))
+    }
+
+    fn aggregate_with_stream(
+        &self,
+        requests: &[AggregationRequest],
+        stream: Option<&CuDFStream>,
+    ) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)> {
         let mut _refs = Vec::with_capacity(requests.len());
         let requests = requests
             .iter()
@@ -50,7 +67,10 @@ impl CuDFGroupBy {
                 x.inner.as_ptr()
             })
             .collect::<Vec<_>>();
-        let mut gby_result = self.inner.aggregate(&requests)?;
+        let mut gby_result = match stream {
+            Some(stream) => self.inner.aggregate_on(&requests, stream.inner())?,
+            None => self.inner.aggregate(&requests)?,
+        };
         let keys = gby_result.pin_mut().release_keys();
         let keys = CuDFTable::from_ptr(keys);
 
@@ -172,6 +192,7 @@ impl AggregationOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CuDFStreamFlags;
     use arrow::array::{make_array, Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -224,6 +245,34 @@ mod tests {
         // SUM([1, 2, 3, 4, 5]) = 15
         let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
         let result = run_single_group_agg::<Int64Array>(&values, AggregationOp::SUM)?;
+        assert_eq!(result.value(0), 15);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sum_integers_on_stream() -> Result<()> {
+        let stream = CuDFStream::with_flags(CuDFStreamFlags::NonBlocking);
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let keys = Int32Array::from(vec![1; values.len()]);
+
+        let values_col = CuDFColumn::from_arrow_host_on(&values, &stream)?;
+        let keys_table = make_keys_table(&keys)?;
+        let groupby = CuDFGroupBy::from_table_view(keys_table.into_view());
+
+        let mut request = AggregationRequest::from_column_view(values_col.into_view());
+        request.add(AggregationOp::SUM.group_by());
+
+        let (_result_keys, results) = groupby.aggregate_on(&[request], &stream)?;
+        let result_col = results
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let result_array = result_col.into_view().to_arrow_host_on(&stream)?;
+        let result = result_array.as_any().downcast_ref::<Int64Array>().unwrap();
+
         assert_eq!(result.value(0), 15);
         Ok(())
     }

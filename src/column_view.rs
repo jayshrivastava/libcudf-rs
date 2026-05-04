@@ -1,6 +1,6 @@
 use crate::cudf_reference::CuDFRef;
 use crate::data_type::cudf_type_to_arrow;
-use crate::{slice_column, CuDFError};
+use crate::{slice_column, CuDFError, CuDFStream};
 use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow::ffi::FFI_ArrowSchema;
@@ -89,6 +89,18 @@ impl CuDFColumnView {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
+        self.to_arrow_host_with_stream(None)
+    }
+
+    /// Convert this column view to a host Arrow array using an explicit CUDA stream.
+    pub fn to_arrow_host_on(&self, stream: &CuDFStream) -> Result<ArrayRef, CuDFError> {
+        self.to_arrow_host_with_stream(Some(stream))
+    }
+
+    fn to_arrow_host_with_stream(
+        &self,
+        stream: Option<&CuDFStream>,
+    ) -> Result<ArrayRef, CuDFError> {
         let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
 
         // Create schema from the column's data type
@@ -99,7 +111,12 @@ impl CuDFColumnView {
         unsafe {
             let device_array_ptr =
                 &mut device_array as *mut libcudf_sys::ArrowDeviceArray as *mut u8;
-            self.inner.to_arrow_array(device_array_ptr);
+            match stream {
+                Some(stream) => self
+                    .inner
+                    .to_arrow_array_on(device_array_ptr, stream.inner()),
+                None => self.inner.to_arrow_array(device_array_ptr),
+            }
         }
 
         // Convert from FFI structures to Arrow ArrayData

@@ -1,5 +1,5 @@
 use crate::data_type::arrow_type_to_cudf;
-use crate::{CuDFColumnView, CuDFError};
+use crate::{CuDFColumnView, CuDFError, CuDFStream};
 use arrow::array::Array;
 use arrow::ffi::FFI_ArrowArray;
 use arrow_schema::ffi::FFI_ArrowSchema;
@@ -40,6 +40,18 @@ impl CuDFColumn {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn from_arrow_host(array: &dyn Array) -> Result<Self, CuDFError> {
+        Self::from_arrow_host_with_stream(array, None)
+    }
+
+    /// Convert an Arrow array to a cuDF column using an explicit CUDA stream.
+    pub fn from_arrow_host_on(array: &dyn Array, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        Self::from_arrow_host_with_stream(array, Some(stream))
+    }
+
+    fn from_arrow_host_with_stream(
+        array: &dyn Array,
+        stream: Option<&CuDFStream>,
+    ) -> Result<Self, CuDFError> {
         if arrow_type_to_cudf(array.data_type()).is_none() {
             return Err(CuDFError::ArrowError(ArrowError::NotYetImplemented(
                 format!("Arrow type {} not supported in CuDF", array.data_type()),
@@ -53,7 +65,12 @@ impl CuDFColumn {
         let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
         let array_ptr = &ffi_array as *const FFI_ArrowArray as *const u8;
 
-        let inner = unsafe { libcudf_sys::ffi::column_from_arrow(schema_ptr, array_ptr) }?;
+        let inner = match stream {
+            Some(stream) => unsafe {
+                libcudf_sys::ffi::column_from_arrow_on(schema_ptr, array_ptr, stream.inner())
+            }?,
+            None => unsafe { libcudf_sys::ffi::column_from_arrow(schema_ptr, array_ptr) }?,
+        };
         Ok(Self { inner })
     }
 
@@ -71,6 +88,18 @@ impl CuDFColumn {
 
     /// Concatenate multiple [CuDFColumnView]s into a single [CuDFColumn].
     pub fn concat(views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
+        Self::concat_with_stream(views, None)
+    }
+
+    /// Concatenate multiple [CuDFColumnView]s using an explicit CUDA stream.
+    pub fn concat_on(views: Vec<CuDFColumnView>, stream: &CuDFStream) -> Result<Self, CuDFError> {
+        Self::concat_with_stream(views, Some(stream))
+    }
+
+    fn concat_with_stream(
+        views: Vec<CuDFColumnView>,
+        stream: Option<&CuDFStream>,
+    ) -> Result<Self, CuDFError> {
         // Keep the references alive until the concat_column_views operation has completed.
         let mut _refs = Vec::with_capacity(views.len());
         let views = views
@@ -80,13 +109,18 @@ impl CuDFColumn {
                 x.into_inner()
             })
             .collect::<Vec<_>>();
-        Ok(Self::new(libcudf_sys::ffi::concat_column_views(&views)?))
+        let inner = match stream {
+            Some(stream) => libcudf_sys::ffi::concat_column_views_on(&views, stream.inner())?,
+            None => libcudf_sys::ffi::concat_column_views(&views)?,
+        };
+        Ok(Self::new(inner))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CuDFStreamFlags;
     use arrow::array::*;
 
     #[test]
@@ -98,6 +132,23 @@ mod tests {
 
         assert_eq!(column.len(), 5);
         assert!(!column.is_empty());
+    }
+
+    #[test]
+    fn test_column_concat_on_stream() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = CuDFStream::with_flags(CuDFStreamFlags::NonBlocking);
+        let first = Int32Array::from(vec![1, 2]);
+        let second = Int32Array::from(vec![3, 4]);
+
+        let first = CuDFColumn::from_arrow_host_on(&first, &stream)?.into_view();
+        let second = CuDFColumn::from_arrow_host_on(&second, &stream)?.into_view();
+        let result = CuDFColumn::concat_on(vec![first, second], &stream)?
+            .into_view()
+            .to_arrow_host_on(&stream)?;
+
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result.values(), &[1, 2, 3, 4]);
+        Ok(())
     }
 
     #[test]

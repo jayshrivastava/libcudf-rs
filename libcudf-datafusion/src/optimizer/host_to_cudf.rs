@@ -132,11 +132,13 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
             }
         })?;
 
-        if is_cudf_plan(result.data.as_ref()) {
-            Ok(Arc::new(CuDFUnloadExec::new(result.data)))
+        let plan = if is_cudf_plan(result.data.as_ref()) {
+            Arc::new(CuDFUnloadExec::new(result.data))
         } else {
-            Ok(result.data)
-        }
+            result.data
+        };
+
+        assign_gpu_segment_ids(plan)
     }
 
     fn name(&self) -> &str {
@@ -146,4 +148,77 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
     fn schema_check(&self) -> bool {
         false
     }
+}
+
+fn assign_gpu_segment_ids(
+    plan: Arc<dyn ExecutionPlan>,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let mut next_segment_id = 0;
+    Ok(assign_gpu_segment_ids_inner(plan, &mut next_segment_id)?.0)
+}
+
+fn assign_gpu_segment_ids_inner(
+    plan: Arc<dyn ExecutionPlan>,
+    next_segment_id: &mut usize,
+) -> datafusion::common::Result<(Arc<dyn ExecutionPlan>, Option<usize>)> {
+    let children: Vec<_> = plan.children().into_iter().cloned().collect();
+    let mut child_segments = Vec::with_capacity(children.len());
+    let mut new_children = Vec::with_capacity(children.len());
+    let mut children_changed = false;
+
+    for child in &children {
+        let (new_child, segment_id) =
+            assign_gpu_segment_ids_inner(Arc::clone(child), next_segment_id)?;
+        children_changed |= !Arc::ptr_eq(child, &new_child);
+        child_segments.push(segment_id);
+        new_children.push(new_child);
+    }
+
+    let plan = if children_changed {
+        plan.with_new_children(new_children)?
+    } else {
+        plan
+    };
+
+    if let Some(load) = plan.as_any().downcast_ref::<CuDFLoadExec>() {
+        let segment_id = *next_segment_id;
+        *next_segment_id += 1;
+        return Ok((Arc::new(load.with_segment_id(segment_id)), Some(segment_id)));
+    }
+
+    if let Some(aggregate) = plan
+        .as_any()
+        .downcast_ref::<crate::aggregate::CuDFAggregateExec>()
+    {
+        let segment_id = child_segments
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or_else(|| aggregate.segment_id());
+        return Ok((
+            Arc::new(aggregate.with_segment_id(segment_id)),
+            Some(segment_id),
+        ));
+    }
+
+    if let Some(unload) = plan.as_any().downcast_ref::<CuDFUnloadExec>() {
+        let segment_id = child_segments
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or_else(|| unload.segment_id());
+        return Ok((
+            Arc::new(unload.with_segment_id(segment_id)),
+            Some(segment_id),
+        ));
+    }
+
+    if is_cudf_plan(plan.as_ref()) {
+        let segment_id = child_segments.iter().flatten().next().copied();
+        return Ok((plan, segment_id));
+    }
+
+    Ok((plan, None))
 }

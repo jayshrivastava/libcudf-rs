@@ -1,4 +1,5 @@
 use crate::aggregate::{avg, count, max, min, sum};
+use crate::cudf_ext::CuDFExt;
 use crate::optimizer::{CuDFConfig, HostToCuDFRule};
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
@@ -54,7 +55,7 @@ impl TestFramework {
         let plan = df.create_physical_plan().await?;
         Ok(TestPlan {
             plan,
-            ctx: self.ctx.task_ctx(),
+            ctx: Arc::new(self.ctx.task_ctx().with_cudf_task_context()),
         })
     }
 

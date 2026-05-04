@@ -6,6 +6,7 @@
 #include "table.h"
 #include "column.h"
 #include "aggregation.h"
+#include "stream.h"
 #include <cudf/groupby.hpp>
 
 namespace libcudf_bridge {
@@ -62,6 +63,11 @@ namespace libcudf_bridge {
         // Direct cuDF method
         [[nodiscard]] std::unique_ptr<GroupByResult> aggregate(
             rust::Slice<const AggregationRequest * const> requests) const;
+
+        // Direct cuDF method using an explicit stream instead of cuDF's default stream.
+        [[nodiscard]] std::unique_ptr<GroupByResult> aggregate_on(
+            rust::Slice<const AggregationRequest * const> requests,
+            const CudaStream &stream) const;
     };
 
     // GroupBy operations - direct cuDF mappings

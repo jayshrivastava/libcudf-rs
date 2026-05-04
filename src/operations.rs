@@ -1,5 +1,5 @@
 use crate::data_type::arrow_type_to_cudf_data_type;
-use crate::{CuDFColumn, CuDFColumnView, CuDFError, CuDFRef, CuDFTable, CuDFTableView};
+use crate::{CuDFColumn, CuDFColumnView, CuDFError, CuDFRef, CuDFStream, CuDFTable, CuDFTableView};
 use arrow_schema::{ArrowError, DataType};
 use libcudf_sys::ffi;
 use std::sync::Arc;
@@ -154,19 +154,40 @@ pub fn slice_column(
 /// - The cast is not supported (e.g., string to numeric)
 /// - There is insufficient GPU memory
 pub fn cast(column: &CuDFColumnView, target_type: &DataType) -> Result<CuDFColumn, CuDFError> {
+    cast_with_stream(column, target_type, None)
+}
+
+/// Cast a column to a different data type on an explicit CUDA stream.
+pub fn cast_on(
+    column: &CuDFColumnView,
+    target_type: &DataType,
+    stream: &CuDFStream,
+) -> Result<CuDFColumn, CuDFError> {
+    cast_with_stream(column, target_type, Some(stream))
+}
+
+fn cast_with_stream(
+    column: &CuDFColumnView,
+    target_type: &DataType,
+    stream: Option<&CuDFStream>,
+) -> Result<CuDFColumn, CuDFError> {
     let cudf_dt = arrow_type_to_cudf_data_type(target_type).ok_or_else(|| {
         CuDFError::ArrowError(ArrowError::NotYetImplemented(format!(
             "Arrow type {} not supported in cuDF cast",
             target_type
         )))
     })?;
-    let result = ffi::cast_column(column.inner(), &cudf_dt)?;
+    let result = match stream {
+        Some(stream) => ffi::cast_column_on(column.inner(), &cudf_dt, stream.inner())?,
+        None => ffi::cast_column(column.inner(), &cudf_dt)?,
+    };
     Ok(CuDFColumn::new(result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CuDFStreamFlags;
     use arrow::array::*;
 
     #[test]
@@ -176,6 +197,20 @@ mod tests {
 
         let casted = cast(&column, &DataType::Int64)?;
         let result = casted.into_view().to_arrow_host()?;
+
+        let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(result.values(), &[1i64, 2, 3, 4, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cast_int32_to_int64_on_stream() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = CuDFStream::with_flags(CuDFStreamFlags::NonBlocking);
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let column = CuDFColumn::from_arrow_host_on(&array, &stream)?.into_view();
+
+        let casted = cast_on(&column, &DataType::Int64, &stream)?;
+        let result = casted.into_view().to_arrow_host_on(&stream)?;
 
         let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(result.values(), &[1i64, 2, 3, 4, 5]);

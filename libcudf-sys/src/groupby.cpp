@@ -70,6 +70,39 @@ namespace libcudf_bridge {
         return group_by_result;
     }
 
+    std::unique_ptr<GroupByResult> GroupBy::aggregate_on(
+        rust::Slice<const AggregationRequest * const> requests,
+        const CudaStream &stream) const {
+        std::vector<cudf::groupby::aggregation_request> cudf_requests;
+        cudf_requests.reserve(requests.size());
+        for (auto *req: requests) {
+            cudf::groupby::aggregation_request cudf_req;
+            cudf_req.values = req->inner->values;
+            for (auto &agg: req->inner->aggregations) {
+                auto cloned = agg->clone();
+                auto *groupby_agg = dynamic_cast<cudf::groupby_aggregation *>(cloned.release());
+                cudf_req.aggregations.push_back(std::unique_ptr<cudf::groupby_aggregation>(groupby_agg));
+            }
+            cudf_requests.push_back(std::move(cudf_req));
+        }
+
+        auto aggregate_result = inner->aggregate(cudf_requests, stream.view());
+
+        auto group_by_result = std::make_unique<GroupByResult>();
+        group_by_result->keys.inner = std::move(aggregate_result.first);
+
+        for (auto &cudf_agg_result: aggregate_result.second) {
+            auto result = std::vector<Column>();
+            result.reserve(cudf_agg_result.results.size());
+            for (auto &col: cudf_agg_result.results) {
+                result.emplace_back(column_from_unique_ptr(std::move(col)));
+            }
+            group_by_result->results.emplace_back(std::move(result));
+        }
+
+        return group_by_result;
+    }
+
     // AggregationRequest implementation
     AggregationRequest::AggregationRequest() : inner(std::make_unique<cudf::groupby::aggregation_request>()) {
     }
