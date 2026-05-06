@@ -62,6 +62,11 @@ namespace libcudf_bridge {
         // Direct cuDF method
         [[nodiscard]] std::unique_ptr<GroupByResult> aggregate(
             rust::Slice<const AggregationRequest * const> requests) const;
+
+        // Aggregate using an explicit CUDA stream.
+        [[nodiscard]] std::unique_ptr<GroupByResult> aggregate_on(
+            rust::Slice<const AggregationRequest * const> requests,
+            const CudaStream &stream) const;
     };
 
     // GroupBy operations - direct cuDF mappings

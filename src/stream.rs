@@ -1,3 +1,4 @@
+use crate::errors::Result;
 use cxx::UniquePtr;
 
 /// Stream creation flags for CUDA stream-backed cuDF execution.
@@ -52,10 +53,30 @@ impl CuDFStream {
     pub(crate) fn inner(&self) -> &libcudf_sys::ffi::CudaStream {
         self.inner.as_ref().expect("CudaStream should not be null")
     }
+
+    /// Block the calling thread until all GPU work submitted to this stream
+    /// has completed.
+    pub fn synchronize(&self) -> Result<()> {
+        self.inner().synchronize()?;
+        Ok(())
+    }
 }
 
 impl Default for CuDFStream {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for CuDFStream {
+    fn drop(&mut self) {
+        // Release the per-stream entry in the device memory pool *before*
+        // the underlying CUDA stream is destroyed. The pool's cached
+        // memory is freed via `cudaMemPoolDestroy`; without this hook the
+        // map of per-stream pools grows unboundedly across iterations and
+        // exhausts the GPU.
+        if let Some(stream) = self.inner.as_ref() {
+            libcudf_sys::ffi::release_device_pool_stream(stream);
+        }
     }
 }

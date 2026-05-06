@@ -56,6 +56,8 @@ impl PreparedCuDFAggregate {
 #[derive(Debug)]
 pub struct CuDFAggregateExec {
     input: Arc<dyn ExecutionPlan>,
+    /// GPU segment id this aggregate belongs to.
+    segment_id: usize,
     prepared: PreparedCuDFAggregate,
     plan_properties: Arc<PlanProperties>,
 }
@@ -77,6 +79,19 @@ impl CuDFAggregateExec {
         };
 
         Self::try_new_prepared(input, prepared)
+    }
+
+    pub fn segment_id(&self) -> usize {
+        self.segment_id
+    }
+
+    pub(crate) fn with_segment_id(&self, segment_id: usize) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            segment_id,
+            prepared: self.prepared.clone(),
+            plan_properties: Arc::clone(&self.plan_properties),
+        }
     }
 
     fn try_new_prepared(
@@ -129,6 +144,7 @@ impl CuDFAggregateExec {
 
         Ok(Self {
             input,
+            segment_id: 0,
             prepared,
             plan_properties,
         })
@@ -183,7 +199,8 @@ impl ExecutionPlan for CuDFAggregateExec {
             self.prepared.mode,
             self.prepared.group_by.clone(),
             self.prepared.aggr_expr(),
-        )?;
+        )?
+        .with_segment_id(self.segment_id);
 
         Ok(Arc::new(new))
     }
@@ -193,8 +210,23 @@ impl ExecutionPlan for CuDFAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
-        let stream = stream::Stream::new(input, self.schema(), self.prepared.clone())?;
+        // Run input.execute first so that CuDFLoadExec (deeper in the chain)
+        // gets a chance to register the stream for this (segment, partition)
+        // before we try to look it up.
+        let input = self.input.execute(partition, Arc::clone(&context))?;
+        let cuda_stream = if crate::task_context::cuda_streams_enabled(&context) {
+            let cudf_ctx = crate::task_context::CuDFTaskContext::from_ctx(&context)?;
+            Some(cudf_ctx.stream(self.segment_id, partition).ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "CUDA stream not assigned for cuDF segment {} partition {}",
+                    self.segment_id, partition
+                ))
+            })?)
+        } else {
+            None
+        };
+        let stream =
+            stream::Stream::new(input, self.schema(), self.prepared.clone(), cuda_stream)?;
         Ok(Box::pin(stream))
     }
 }

@@ -10,13 +10,20 @@
 #include <cudf/utilities/pinned_memory.hpp>
 #include <cudf/version_config.hpp>
 
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/device/per_device_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
+#include <cuda_runtime.h>
+
 #include <nanoarrow/nanoarrow.h>
 
+#include <memory>
+#include <shared_mutex>
 #include <sstream>
+#include <unordered_map>
 
 namespace libcudf_bridge {
     // Factory functions
@@ -55,6 +62,19 @@ namespace libcudf_bridge {
         return table;
     }
 
+    std::unique_ptr<Table> concat_table_views_on(
+        rust::Slice<const std::unique_ptr<TableView>> views,
+        const CudaStream &stream) {
+        std::vector<cudf::table_view> table_views;
+        table_views.reserve(views.size());
+        for (auto &col: views) {
+            table_views.push_back(std::move(*col->inner));
+        }
+        auto table = std::make_unique<Table>();
+        table->inner = cudf::concatenate(table_views, stream.view());
+        return table;
+    }
+
     std::unique_ptr<Column> concat_column_views(rust::Slice<const std::unique_ptr<ColumnView>> views) {
         std::vector<cudf::column_view> table_views;
         table_views.reserve(views.size());
@@ -67,6 +87,19 @@ namespace libcudf_bridge {
         auto table = std::make_unique<Column>();
         table->inner = cudf::concatenate(table_views);
         return table;
+    }
+
+    std::unique_ptr<Column> concat_column_views_on(
+        rust::Slice<const std::unique_ptr<ColumnView>> views,
+        const CudaStream &stream) {
+        std::vector<cudf::column_view> column_views;
+        column_views.reserve(views.size());
+        for (auto &col: views) {
+            column_views.push_back(std::move(*col->inner));
+        }
+        auto column = std::make_unique<Column>();
+        column->inner = cudf::concatenate(column_views, stream.view());
+        return column;
     }
 
     // Direct cuDF operations - 1:1 mappings
@@ -122,15 +155,103 @@ namespace libcudf_bridge {
         return {version.str()};
     }
 
-    bool config_device_memory_pool(size_t initial_bytes, size_t max_bytes) {
-        static std::unique_ptr<rmm::mr::cuda_memory_resource> base_mr;
-        static std::unique_ptr<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>> pool_mr;
-        if (pool_mr) return false;
-        base_mr = std::make_unique<rmm::mr::cuda_memory_resource>();
-        pool_mr = std::make_unique<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
-            base_mr.get(), initial_bytes, max_bytes);
-        rmm::mr::set_current_device_resource(pool_mr.get());
+    // Per-stream wrapper around `cuda_async_memory_resource`.
+    //
+    // A single shared `cuda_async_memory_resource` becomes a hot spot once
+    // multiple CUDA streams allocate from it concurrently: the CUDA driver
+    // inserts cross-stream ordering events on every reuse, and per-call
+    // `cudaMallocFromPoolAsync` cost grows from ~10 µs to ~36 µs in our
+    // 4-stream agg workload. Each (segment, partition) in our pipeline is
+    // bound to exactly one stream — there's no cross-stream traffic to
+    // preserve — so we can give each stream its own CUDA mempool. The
+    // driver then sees one stream per pool and elides the cross-stream
+    // bookkeeping.
+    class per_stream_async_mr final : public rmm::mr::device_memory_resource {
+    public:
+        // `release_threshold` is the cuda_async pool's release threshold —
+        // memory cached up to this amount per pool stays resident on free,
+        // anything above is returned to CUDA. We do *not* pre-reserve any
+        // memory per pool; pools grow lazily via `cudaMallocFromPoolAsync`.
+        // Pre-reserving N × initial up front would OOM for typical N=4.
+        explicit per_stream_async_mr(std::optional<std::size_t> release_threshold)
+            : release_threshold_{release_threshold} {}
+
+    private:
+        void* do_allocate(std::size_t bytes,
+                          rmm::cuda_stream_view stream) override {
+            return resource_for(stream)->allocate(bytes, stream);
+        }
+
+        void do_deallocate(void* p, std::size_t bytes,
+                           rmm::cuda_stream_view stream) override {
+            // `cudaFreeAsync` routes by ptr internally; any per-stream MR
+            // works. We pick the one for this stream so RMM accounting
+            // stays consistent.
+            resource_for(stream)->deallocate(p, bytes, stream);
+        }
+
+        rmm::mr::cuda_async_memory_resource* resource_for(
+            rmm::cuda_stream_view stream)
+        {
+            cudaStream_t key = stream.value();
+            {
+                std::shared_lock<std::shared_mutex> lock(mtx_);
+                auto it = pools_.find(key);
+                if (it != pools_.end()) return it->second.get();
+            }
+            std::unique_lock<std::shared_mutex> lock(mtx_);
+            auto& slot = pools_[key];
+            if (!slot) {
+                // initial_pool_size = small explicit value (1 MiB). RMM's
+                // default-when-nullopt is `free_device_memory / 2`, which
+                // would have each per-stream pool grab half the GPU at
+                // construction and OOM after a few streams.
+                constexpr std::size_t small_initial = 1UL << 20;
+                slot = std::make_unique<rmm::mr::cuda_async_memory_resource>(
+                    std::optional<std::size_t>{small_initial},
+                    release_threshold_);
+            }
+            return slot.get();
+        }
+
+    public:
+        // Drop the pool associated with `stream`, returning any cached
+        // memory to the OS via `cudaMemPoolDestroy`. Must be called before
+        // the stream itself is destroyed.
+        void release_for(cudaStream_t stream)
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx_);
+            pools_.erase(stream);
+        }
+
+        std::optional<std::size_t> release_threshold_;
+        std::shared_mutex mtx_;
+        std::unordered_map<
+            cudaStream_t,
+            std::unique_ptr<rmm::mr::cuda_async_memory_resource>>
+            pools_;
+    };
+
+    namespace {
+        // File-scope so `release_device_pool_stream` can reach it.
+        std::unique_ptr<per_stream_async_mr> g_per_stream_mr;
+    }
+
+    bool config_device_memory_pool(size_t /*initial_bytes*/, size_t max_bytes) {
+        // `initial_bytes` is intentionally ignored: pre-reserving N × initial
+        // memory across N per-stream pools OOMs at typical configurations.
+        // Pools grow lazily; `max_bytes` is used as the per-pool release
+        // threshold (memory cached up to this size on free).
+        if (g_per_stream_mr) return false;
+        g_per_stream_mr = std::make_unique<per_stream_async_mr>(
+            std::optional<std::size_t>{max_bytes});
+        rmm::mr::set_current_device_resource(g_per_stream_mr.get());
         return true;
+    }
+
+    void release_device_pool_stream(const CudaStream& stream) {
+        if (!g_per_stream_mr || !stream.is_valid()) return;
+        g_per_stream_mr->release_for(stream.view().value());
     }
 
     bool config_pinned_memory_resource(size_t pool_size_bytes) {
@@ -151,6 +272,17 @@ namespace libcudf_bridge {
         return result;
     }
 
+    std::unique_ptr<Table> table_from_arrow_host_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *device_array_ptr,
+        const CudaStream &stream) {
+        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+        auto *device_array = reinterpret_cast<const ArrowDeviceArray *>(device_array_ptr);
+        auto result = std::make_unique<Table>();
+        result->inner = cudf::from_arrow_host(schema, device_array, stream.view());
+        return result;
+    }
+
     // Arrow interop - convert Arrow array to cuDF column
     std::unique_ptr<Column> column_from_arrow(uint8_t const *schema_ptr, uint8_t const *array_ptr) {
         auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
@@ -158,6 +290,17 @@ namespace libcudf_bridge {
 
         auto result = std::make_unique<Column>();
         result->inner = cudf::from_arrow_column(schema, array);
+        return result;
+    }
+
+    std::unique_ptr<Column> column_from_arrow_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *array_ptr,
+        const CudaStream &stream) {
+        auto *schema = reinterpret_cast<const ArrowSchema *>(schema_ptr);
+        auto *array = reinterpret_cast<const ArrowArray *>(array_ptr);
+        auto result = std::make_unique<Column>();
+        result->inner = cudf::from_arrow_column(schema, array, stream.view());
         return result;
     }
 } // namespace libcudf_bridge

@@ -18,11 +18,29 @@ namespace libcudf_bridge {
     // Arrow interop - direct cuDF calls
     std::unique_ptr<Table> table_from_arrow_host(uint8_t const *schema_ptr, uint8_t const *device_array_ptr);
 
+    std::unique_ptr<Table> table_from_arrow_host_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *device_array_ptr,
+        const CudaStream &stream);
+
     std::unique_ptr<Column> column_from_arrow(uint8_t const *schema_ptr, uint8_t const *array_ptr);
+
+    std::unique_ptr<Column> column_from_arrow_on(
+        uint8_t const *schema_ptr,
+        uint8_t const *array_ptr,
+        const CudaStream &stream);
 
     std::unique_ptr<Table> concat_table_views(rust::Slice<const std::unique_ptr<TableView>> views);
 
+    std::unique_ptr<Table> concat_table_views_on(
+        rust::Slice<const std::unique_ptr<TableView>> views,
+        const CudaStream &stream);
+
     std::unique_ptr<Column> concat_column_views(rust::Slice<const std::unique_ptr<ColumnView>> views);
+
+    std::unique_ptr<Column> concat_column_views_on(
+        rust::Slice<const std::unique_ptr<ColumnView>> views,
+        const CudaStream &stream);
 
     // Gather rows from a table based on a gather map (column of indices)
     std::unique_ptr<Table> gather(const TableView &source_table, const ColumnView &gather_map);
@@ -39,4 +57,9 @@ namespace libcudf_bridge {
 
     // Device-memory pool configuration
     bool config_device_memory_pool(size_t initial_bytes, size_t max_bytes);
+
+    // Drop the per-stream device pool entry for `stream`. Called from
+    // `CuDFStream::Drop` before the stream itself is destroyed; releases
+    // any cached pool memory back to CUDA.
+    void release_device_pool_stream(const CudaStream& stream);
 } // namespace libcudf_bridge

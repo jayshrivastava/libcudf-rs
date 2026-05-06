@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::task_context::{cuda_streams_enabled, CuDFTaskContext};
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::{plan_err, DataFusionError};
@@ -10,22 +11,33 @@ use futures_util::StreamExt;
 use libcudf_rs::CuDFTableView;
 use std::any::Any;
 use std::fmt::Formatter;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub struct CuDFUnloadExec {
     input: Arc<dyn ExecutionPlan>,
+    /// GPU segment id this unload terminates. Used to look up the CUDA
+    /// stream for `(segment_id, partition)` when streams are enabled, and
+    /// to release it once the partition stream finishes.
+    segment_id: usize,
     properties: Arc<PlanProperties>,
 }
 
 impl CuDFUnloadExec {
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self::new_with_segment_id(input, 0)
+    }
+
+    pub fn new_with_segment_id(input: Arc<dyn ExecutionPlan>, segment_id: usize) -> Self {
         let mut properties = input.properties().as_ref().clone();
         properties.eq_properties =
             EquivalenceProperties::new(cudf_unload_schema_map(input.schema()));
         Self {
             properties: Arc::new(properties),
             input,
+            segment_id,
         }
     }
 
@@ -35,6 +47,19 @@ impl CuDFUnloadExec {
         Self {
             properties: Arc::new(properties),
             input: Arc::clone(&self.input),
+            segment_id: self.segment_id,
+        }
+    }
+
+    pub fn segment_id(&self) -> usize {
+        self.segment_id
+    }
+
+    pub(crate) fn with_segment_id(&self, segment_id: usize) -> Self {
+        Self {
+            input: Arc::clone(&self.input),
+            segment_id,
+            properties: Arc::clone(&self.properties),
         }
     }
 }
@@ -73,7 +98,7 @@ impl ExecutionPlan for CuDFUnloadExec {
             );
         }
         let input = Arc::clone(&children[0]);
-        Ok(Arc::new(Self::new(input)))
+        Ok(Arc::new(Self::new_with_segment_id(input, self.segment_id)))
     }
 
     fn execute(
@@ -81,7 +106,29 @@ impl ExecutionPlan for CuDFUnloadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        let cudf_stream = self.input.execute(partition, context)?;
+        // Run input.execute first so the deeper CuDFLoadExec registers the
+        // stream for this (segment, partition) before we look it up.
+        let cudf_stream = self.input.execute(partition, Arc::clone(&context))?;
+        let (cuda_stream, cleanup) = if cuda_streams_enabled(&context) {
+            let cudf_ctx = CuDFTaskContext::from_ctx(&context)?;
+            let stream = cudf_ctx.stream(self.segment_id, partition).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "CUDA stream not assigned for cuDF segment {} partition {}",
+                    self.segment_id, partition
+                ))
+            })?;
+            (
+                Some(stream),
+                Some(StreamCleanup {
+                    cudf_ctx,
+                    segment_id: self.segment_id,
+                    partition,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
         let target_schema = self.schema();
         let host_stream = cudf_stream.map(move |batch_or_err| {
             let batch = match batch_or_err {
@@ -90,7 +137,10 @@ impl ExecutionPlan for CuDFUnloadExec {
             };
 
             let view = CuDFTableView::from_record_batch(&batch).map_err(cudf_to_df)?;
-            let host_batch = view.to_arrow_host().map_err(cudf_to_df)?;
+            let host_batch = match cuda_stream.as_deref() {
+                Some(stream) => view.to_arrow_host_on(stream).map_err(cudf_to_df)?,
+                None => view.to_arrow_host().map_err(cudf_to_df)?,
+            };
             let num_rows = host_batch.num_rows();
             let columns = host_batch
                 .columns()
@@ -108,10 +158,63 @@ impl ExecutionPlan for CuDFUnloadExec {
                 },
             )
         });
+        let host_stream = UnsetStreamOnEnd::new(Box::pin(host_stream), cleanup);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             host_stream,
         )))
+    }
+}
+
+struct StreamCleanup {
+    cudf_ctx: Arc<CuDFTaskContext>,
+    segment_id: usize,
+    partition: usize,
+}
+
+/// Stream wrapper that unsets the cuDF stream entry for `(segment, partition)`
+/// once the underlying batch stream finishes, freeing its allocator slot.
+struct UnsetStreamOnEnd {
+    inner: Pin<
+        Box<dyn futures_util::Stream<Item = datafusion::common::Result<RecordBatch>> + Send>,
+    >,
+    cleanup: Option<StreamCleanup>,
+}
+
+impl UnsetStreamOnEnd {
+    fn new(
+        inner: Pin<
+            Box<dyn futures_util::Stream<Item = datafusion::common::Result<RecordBatch>> + Send>,
+        >,
+        cleanup: Option<StreamCleanup>,
+    ) -> Self {
+        Self { inner, cleanup }
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup
+                .cudf_ctx
+                .unset_stream(cleanup.segment_id, cleanup.partition);
+        }
+    }
+}
+
+impl futures_util::Stream for UnsetStreamOnEnd {
+    type Item = datafusion::common::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.cleanup();
+        }
+        poll
+    }
+}
+
+impl Drop for UnsetStreamOnEnd {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 

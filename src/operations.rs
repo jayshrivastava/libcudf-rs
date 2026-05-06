@@ -164,6 +164,22 @@ pub fn cast(column: &CuDFColumnView, target_type: &DataType) -> Result<CuDFColum
     Ok(CuDFColumn::new(result))
 }
 
+/// Same as [`cast`] but issues the work on the given CUDA stream.
+pub fn cast_on(
+    column: &CuDFColumnView,
+    target_type: &DataType,
+    stream: &crate::CuDFStream,
+) -> Result<CuDFColumn, CuDFError> {
+    let cudf_dt = arrow_type_to_cudf_data_type(target_type).ok_or_else(|| {
+        CuDFError::ArrowError(ArrowError::NotYetImplemented(format!(
+            "Arrow type {} not supported in cuDF cast",
+            target_type
+        )))
+    })?;
+    let result = ffi::cast_column_on(column.inner(), &cudf_dt, stream.inner())?;
+    Ok(CuDFColumn::new(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

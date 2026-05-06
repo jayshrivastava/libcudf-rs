@@ -34,6 +34,13 @@ namespace libcudf_bridge {
         return inner && inner->is_valid();
     }
 
+    void CudaStream::synchronize() const {
+        if (!inner) {
+            throw std::runtime_error("Cannot synchronize null CUDA stream");
+        }
+        inner->synchronize();
+    }
+
     rmm::cuda_stream_view CudaStream::view() const {
         // In case `inner` gets moved by assigning one `CudaStream` to another.
         if (!inner) {

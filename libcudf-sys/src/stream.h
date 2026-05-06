@@ -24,6 +24,11 @@ namespace libcudf_bridge {
         /// owns its underlying `rmm::cuda_stream`.
         [[nodiscard]] bool is_valid() const;
 
+        /// Block the calling thread until all work submitted to this stream has
+        /// completed. Used by callers that need a host-visible result (e.g. so
+        /// a pinned source buffer can be safely freed once the DMA is done).
+        void synchronize() const;
+
         /// Return a non-owning stream view for passing into cuDF APIs.
         [[nodiscard]] rmm::cuda_stream_view view() const;
     };
