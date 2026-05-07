@@ -35,6 +35,7 @@ pub mod ffi {
         include!("libcudf-sys/src/sorting.h");
         include!("libcudf-sys/src/join.h");
         include!("libcudf-sys/src/stream.h");
+        include!("libcudf-sys/src/event.h");
         include!("libcudf-sys/src/pinned_host.h");
 
         /// A set of cuDF columns of the same size
@@ -715,6 +716,22 @@ pub mod ffi {
 
         /// Block until all work on the CUDA default stream has completed.
         fn cuda_default_stream_synchronize() -> Result<()>;
+
+        /// Owning wrapper for a CUDA event (`cudaEventDisableTiming`). See
+        /// `event.h` for the lifecycle and the pinned-ring use case.
+        type CudaEvent;
+
+        /// Record the event at the current point in the CUDA default stream.
+        fn record_on_default_stream(self: &CudaEvent) -> Result<()>;
+
+        /// Non-blocking check: returns `true` if the event has fired.
+        fn query(self: &CudaEvent) -> Result<bool>;
+
+        /// Block the calling thread until the event fires.
+        fn synchronize(self: &CudaEvent) -> Result<()>;
+
+        /// Create a CUDA event with `cudaEventDisableTiming` set.
+        fn cuda_event_create() -> Result<UniquePtr<CudaEvent>>;
     }
 }
 
@@ -1080,6 +1097,15 @@ unsafe impl Send for ffi::TableView {}
 
 /// SAFETY: TableView can be safely accessed from multiple threads.
 unsafe impl Sync for ffi::TableView {}
+
+/// SAFETY: `cudaEvent_t` is a process-global handle. The CUDA runtime
+/// permits recording, querying, synchronizing, and destroying events from
+/// any host thread.
+unsafe impl Send for ffi::CudaEvent {}
+
+/// SAFETY: All `CudaEvent` member functions exposed across the FFI are
+/// thread-safe per the CUDA runtime spec.
+unsafe impl Sync for ffi::CudaEvent {}
 
 /// SAFETY: Scalar contains GPU memory and can be sent between threads.
 unsafe impl Send for ffi::Scalar {}

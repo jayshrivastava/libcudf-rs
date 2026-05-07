@@ -49,7 +49,9 @@ pub use join::{
     CuDFNullEquality,
 };
 pub use operations::{apply_boolean_mask, cast, gather, slice_column};
-pub use pinned::{pin_record_batch, synchronize_default_stream, PinnedHostBuffer};
+pub use pinned::{
+    pin_record_batch, synchronize_default_stream, CuDFEvent, PinRing, PinnedBatch, PinnedHostBuffer,
+};
 pub use pinned_pool::PinnedPoolConfig;
 pub use scalar::CuDFScalar;
 pub use sort::{sort, sort_by_all, stable_sorted_order, SortOrder};

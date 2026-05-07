@@ -14,11 +14,11 @@ use arrow::array::{make_array, ArrayData, ArrayDataBuilder, RecordBatch};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
-    cuda_default_stream_synchronize, pinned_host_alloc, pinned_host_free, PinnedHostAlloc,
+    cuda_default_stream_synchronize, cuda_event_create, pinned_host_alloc, pinned_host_free,
+    CudaEvent, PinnedHostAlloc,
 };
-use std::cell::RefCell;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::errors::Result;
 
@@ -80,74 +80,53 @@ pub struct PinnedHostBuffer {
     requested_bytes: usize,
 }
 
-thread_local! {
-    /// Thread-local pool of pinned host allocations available for reuse.
-    ///
-    /// `cudaMallocHost` / `cudaFreeHost` each take hundreds of microseconds,
-    /// so allocations are recycled here instead of being freed on drop. On a
-    /// `new(bytes)` request we linearly pick the smallest pooled allocation
-    /// with capacity >= `bytes`; the pool stays small enough that the linear
-    /// scan is fine. `cudaFreeHost` only runs when the pool itself drops at
-    /// thread exit (see [`PinnedAllocOwner::drop`]).
-    ///
-    /// # Why thread-local instead of a global pool
-    ///
-    /// 1. No locking on the hot path (~20K allocs per aggregate query). A
-    ///    global pool would need a `Mutex<Vec<...>>` on every alloc/free.
-    /// 2. NUMA locality — the memory stays close to the CPU that pinned it.
-    ///
-    /// Tradeoff: a buffer allocated on Thread A and dropped on Thread B
-    /// (e.g. across an `.await` where a tokio task hopped workers) ends up
-    /// in B's pool, not A's. That's an efficiency loss, not a correctness
-    /// bug, and our hot path (`pin_record_batch` → `from_arrow_host` →
-    /// drop) is synchronous within a single closure so it doesn't trip that
-    /// case in practice.
-    ///
-    /// # Why `RefCell` is sufficient (no `Mutex`)
-    ///
-    /// `thread_local!` gives each thread its own `RefCell`, and the only
-    /// way to reach it — `PINNED_POOL.with(|cell| ...)` — hands out a borrow
-    /// whose lifetime is tied to the closure; that borrow can't be returned,
-    /// stored, or `Send`-ed to another thread. So no two threads ever hold
-    /// a reference to the same `RefCell`, and the runtime borrow check only
-    /// has to guard same-thread reentrancy. (A plain `static RefCell<...>`
-    /// wouldn't compile because `RefCell` is `!Sync`; `thread_local!` is
-    /// the escape hatch.)
-    ///
-    /// # Why we don't reuse RMM's pool
-    ///
-    /// RMM ships `rmm::mr::pinned_host_memory_resource`; combined with
-    /// `rmm::mr::pool_memory_resource` it would give equivalent pooling for
-    /// free. We deliberately don't use it: exposing an RMM resource through
-    /// cxx is several files of glue for one call site, and a plain
-    /// `Vec<PinnedAllocOwner>` is easy to read, easy to test, and ~50 LOC.
-    /// Worth revisiting if more pinned-memory consumers land in this crate.
-    ///
-    /// Unrelated to [`crate::PinnedPoolConfig`], which configures cuDF's
-    /// *internal* pinned pool used for the download path.
-    static PINNED_POOL: RefCell<Vec<PinnedAllocOwner>> =
-        const { RefCell::new(Vec::new()) };
+/// Process-global pool of pinned host allocations available for reuse.
+///
+/// `cudaMallocHost` / `cudaFreeHost` each take hundreds of microseconds, so
+/// allocations are recycled here instead of being freed on drop. On a
+/// `new(bytes)` request we linearly pick the smallest pooled allocation with
+/// capacity >= `bytes`; the pool stays small enough that the linear scan is
+/// fine. `cudaFreeHost` only runs when the pool itself drops at process
+/// exit (see [`PinnedAllocOwner::drop`]).
+///
+/// # Why global instead of thread-local
+///
+/// `PinnedHostBuffer::Drop` may run on a CUDA-managed thread (the host
+/// callback launched via `cudaLaunchHostFunc` to defer release until the
+/// async H2D completes — see [`launch_pinned_release_on_default_stream`]).
+/// A thread-local pool would route those releases into the CUDA thread's
+/// pool, where worker threads can never see them, eliminating reuse and
+/// causing a `cudaMallocHost` storm. A global pool ensures the buffer is
+/// available to whichever thread next calls [`PinnedHostBuffer::new`].
+///
+/// Mutex contention is small in practice: each batch's pin/unpin path
+/// touches the lock briefly (push/pop on a Vec) and per-iter allocation
+/// counts are in the thousands across many threads.
+static PINNED_POOL: OnceLock<Mutex<Vec<PinnedAllocOwner>>> = OnceLock::new();
+
+fn pinned_pool() -> &'static Mutex<Vec<PinnedAllocOwner>> {
+    PINNED_POOL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[cfg(test)]
 fn pool_len() -> usize {
-    PINNED_POOL.with(|p| p.borrow().len())
+    pinned_pool().lock().unwrap().len()
 }
 
-/// Drop every cached allocation on the current thread. Drains via
-/// [`PinnedAllocOwner::drop`], so any `cudaFreeHost` failure becomes a panic
-/// here. Test-only — production code never needs to drain explicitly.
+/// Drop every cached allocation. Drains via [`PinnedAllocOwner::drop`], so
+/// any `cudaFreeHost` failure becomes a panic here. Test-only — production
+/// code never needs to drain explicitly.
 #[cfg(test)]
 fn drain_pool() {
-    PINNED_POOL.with(|p| p.borrow_mut().clear());
+    pinned_pool().lock().unwrap().clear();
 }
 
 impl PinnedHostBuffer {
-    /// Allocate `bytes` of pinned host memory, reusing a pooled buffer if one
-    /// of sufficient capacity is available on the current thread.
+    /// Allocate `bytes` of pinned host memory, reusing a pooled buffer if
+    /// one of sufficient capacity is available in the global pool.
     pub fn new(bytes: usize) -> Result<Self> {
-        let pooled = PINNED_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
+        let pooled = {
+            let mut pool = pinned_pool().lock().expect("PINNED_POOL poisoned");
             // Pick the smallest pooled buffer with capacity >= requested.
             let pos = pool
                 .iter()
@@ -156,7 +135,7 @@ impl PinnedHostBuffer {
                 .min_by_key(|(_, owner)| owner.capacity())
                 .map(|(i, _)| i);
             pos.map(|i| pool.swap_remove(i))
-        });
+        };
         let inner = match pooled {
             Some(owner) => owner,
             None => PinnedAllocOwner::new(bytes)?,
@@ -190,10 +169,21 @@ impl PinnedHostBuffer {
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
         if let Some(owner) = self.inner.take() {
-            // Return to the thread-local pool for reuse rather than freeing.
-            // The actual `cudaFreeHost` happens when the pool itself drops at
-            // thread exit, via `PinnedAllocOwner::drop`.
-            PINNED_POOL.with(|pool| pool.borrow_mut().push(owner));
+            // Return to the global pool for reuse rather than freeing.
+            // The actual `cudaFreeHost` happens at process exit when the
+            // OnceLock drops the inner Mutex, via `PinnedAllocOwner::drop`.
+            //
+            // This Drop may run on either a worker thread (when no GPU
+            // ownership transfer happened) or on a CUDA-managed callback
+            // thread (when the table that owned this buffer scheduled a
+            // stream-ordered release). Either way the global pool serves
+            // both producers.
+            if let Ok(mut pool) = pinned_pool().lock() {
+                pool.push(owner);
+            } else {
+                // Pool mutex poisoned — let `owner` drop here, which calls
+                // `cudaFreeHost` synchronously. Slower but safe.
+            }
         }
     }
 }
@@ -209,8 +199,20 @@ pub fn synchronize_default_stream() -> Result<()> {
     Ok(())
 }
 
-/// Return a copy of `batch` whose underlying buffers all live in pinned
-/// (page-locked) host memory.
+/// A [`RecordBatch`] whose host buffers are all pinned, plus the
+/// `Arc<PinnedHostBuffer>` keepalives that anchor those buffers' lifetimes.
+///
+/// Returned by [`pin_record_batch`]. Callers that only need the
+/// [`RecordBatch`] can drop `buffers`; callers that need to defer the
+/// pinned source's release until a stream-ordered point should keep them.
+pub struct PinnedBatch {
+    pub batch: RecordBatch,
+    pub buffers: Vec<Arc<PinnedHostBuffer>>,
+}
+
+/// Return a [`PinnedBatch`] whose underlying buffers all live in pinned
+/// (page-locked) host memory, plus a vector of `Arc<PinnedHostBuffer>`
+/// keepalives — one per leaf buffer that was pinned.
 ///
 /// The schema, lengths, offsets, and null counts of every column are
 /// preserved exactly; only the host-side storage of each leaf
@@ -218,28 +220,41 @@ pub fn synchronize_default_stream() -> Result<()> {
 ///
 /// Empty buffers are passed through unchanged because `cudaMallocHost(0)` is
 /// not portable and a zero-byte buffer has no data to DMA.
-pub fn pin_record_batch(batch: RecordBatch) -> Result<RecordBatch> {
+///
+/// The caller must keep `buffers` alive until any async H2D copy reading
+/// from `batch`'s storage has completed. The intended use is to attach
+/// `buffers` to the resulting `CuDFTable` via
+/// [`crate::CuDFTable::with_pinned_keepalive`], which schedules a
+/// stream-ordered release once the H2D drains.
+pub fn pin_record_batch(batch: RecordBatch) -> Result<PinnedBatch> {
     let schema = batch.schema();
+    let mut buffers = Vec::new();
     let arrays = batch
         .columns()
         .iter()
-        .map(|arr| pin_array_data(arr.to_data()).map(make_array))
+        .map(|arr| pin_array_data(arr.to_data(), &mut buffers).map(make_array))
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, arrays)?)
+    Ok(PinnedBatch {
+        batch: RecordBatch::try_new(schema, arrays)?,
+        buffers,
+    })
 }
 
-fn pin_array_data(data: ArrayData) -> Result<ArrayData> {
+fn pin_array_data(
+    data: ArrayData,
+    out_buffers: &mut Vec<Arc<PinnedHostBuffer>>,
+) -> Result<ArrayData> {
     let buffers = data
         .buffers()
         .iter()
-        .map(pin_buffer)
+        .map(|b| pin_buffer(b, out_buffers))
         .collect::<Result<Vec<_>>>()?;
 
     let children = data
         .child_data()
         .iter()
         .cloned()
-        .map(pin_array_data)
+        .map(|c| pin_array_data(c, out_buffers))
         .collect::<Result<Vec<_>>>()?;
 
     let mut builder = ArrayDataBuilder::new(data.data_type().clone())
@@ -252,7 +267,7 @@ fn pin_array_data(data: ArrayData) -> Result<ArrayData> {
     // every nullable column still pays the per-call staging cost (~30-60 µs)
     // on its `cudaMemcpyAsync`. Pinning it makes the upload uniformly async.
     if let Some(nulls) = data.nulls() {
-        builder = builder.nulls(Some(pin_null_buffer(nulls)?));
+        builder = builder.nulls(Some(pin_null_buffer(nulls, out_buffers)?));
     }
 
     // SAFETY: only the storage of each leaf buffer is replaced; data type,
@@ -261,16 +276,19 @@ fn pin_array_data(data: ArrayData) -> Result<ArrayData> {
     Ok(unsafe { builder.build_unchecked() })
 }
 
-fn pin_null_buffer(nulls: &NullBuffer) -> Result<NullBuffer> {
+fn pin_null_buffer(
+    nulls: &NullBuffer,
+    out_buffers: &mut Vec<Arc<PinnedHostBuffer>>,
+) -> Result<NullBuffer> {
     let bool_buf = nulls.inner();
-    let pinned = pin_buffer(bool_buf.inner())?;
+    let pinned = pin_buffer(bool_buf.inner(), out_buffers)?;
     let new_bool = BooleanBuffer::new(pinned, bool_buf.offset(), bool_buf.len());
     // SAFETY: `pin_buffer` copies the underlying bytes verbatim, so the bit
     // pattern (and therefore the null count) is preserved.
     Ok(unsafe { NullBuffer::new_unchecked(new_bool, nulls.null_count()) })
 }
 
-fn pin_buffer(buf: &Buffer) -> Result<Buffer> {
+fn pin_buffer(buf: &Buffer, out_buffers: &mut Vec<Arc<PinnedHostBuffer>>) -> Result<Buffer> {
     let bytes = buf.len();
     if bytes == 0 {
         return Ok(buf.clone());
@@ -283,11 +301,187 @@ fn pin_buffer(buf: &Buffer) -> Result<Buffer> {
     // overlap (different allocations).
     unsafe {
         std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes);
-        Ok(Buffer::from_custom_allocation(
+    }
+    out_buffers.push(Arc::clone(&pinned));
+    let arrow_buf = unsafe {
+        Buffer::from_custom_allocation(
             NonNull::new(dst).expect("pinned allocation pointer is non-null"),
             bytes,
             pinned as Arc<dyn Allocation>,
-        ))
+        )
+    };
+    Ok(arrow_buf)
+}
+
+/// Owning Rust wrapper for a CUDA event with `cudaEventDisableTiming`.
+///
+/// Used by [`PinRing`] as a per-slot fence: the ring records this event on
+/// the CUDA default stream after the H2D copy that consumed the slot's
+/// pinned buffers, and synchronizes on it before reusing the slot. This
+/// gives stream-ordered backpressure without a host-blocking
+/// `cudaStreamSynchronize` per batch.
+pub struct CuDFEvent {
+    inner: UniquePtr<CudaEvent>,
+}
+
+// SAFETY: `cudaEvent_t` is a process-global opaque handle. The CUDA runtime
+// allows recording, querying, synchronizing, and destroying events from
+// any host thread. Moving the wrapper across threads is therefore safe,
+// and concurrent `&self` calls into `record_on_default_stream` / `query` /
+// `synchronize` are also safe (the underlying APIs are thread-safe).
+unsafe impl Send for CuDFEvent {}
+unsafe impl Sync for CuDFEvent {}
+
+impl CuDFEvent {
+    /// Create a fresh event with `cudaEventDisableTiming`.
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            inner: cuda_event_create()?,
+        })
+    }
+
+    /// Record this event at the current point in the CUDA default stream.
+    pub fn record_on_default_stream(&self) -> Result<()> {
+        self.inner_ref().record_on_default_stream()?;
+        Ok(())
+    }
+
+    /// Non-blocking check: returns `true` if the event has fired.
+    pub fn query(&self) -> Result<bool> {
+        Ok(self.inner_ref().query()?)
+    }
+
+    /// Block the calling thread until the event fires.
+    pub fn synchronize(&self) -> Result<()> {
+        self.inner_ref().synchronize()?;
+        Ok(())
+    }
+
+    fn inner_ref(&self) -> &CudaEvent {
+        self.inner.as_ref().expect("CudaEvent should not be null")
+    }
+}
+
+/// One slot in [`PinRing`]. Owns a set of pinned host buffers that back the
+/// most recent batch put through this slot, plus the event recorded after
+/// that batch's H2D. The slot's buffers stay alive (held by the slot's
+/// `Arc`s) until the next time this slot is recycled — at which point the
+/// ring synchronizes on `event` first, guaranteeing the H2D has retired
+/// before the buffers can be safely overwritten.
+struct PinSlot {
+    buffers: Vec<Arc<PinnedHostBuffer>>,
+    event: CuDFEvent,
+    in_use: bool,
+}
+
+/// Bounded-pipelining pool of pinned host buffers driven by per-slot CUDA
+/// events.
+///
+/// `PinRing` lets a per-batch upload pipeline stay at most `kRing` batches
+/// ahead of the GPU without ever calling `cudaStreamSynchronize` on the
+/// host. Each batch claims the next slot in round-robin order; if that
+/// slot is on its second-or-later turn, the ring blocks on its event
+/// before allowing reuse. In steady state the event has long since fired,
+/// the wait is a no-op, and the host runs uncontested.
+///
+/// Sizing notes (see `docs/` for the analysis):
+/// - `kRing = 3` covers CPU-fill / H2D / kernel as three concurrent stages
+///   and is the recommended default.
+/// - `kRing = 2` saves ~33% pinned memory at the cost of less overlap
+///   slack.
+/// - Memory cost is `kRing × per_batch_pinned_bytes`, typically megabytes.
+///
+/// The ring is **not** thread-safe by itself — it is intended to live
+/// inside one `CuDFLoadExec`'s per-batch processing loop, where exactly
+/// one task pins/uploads at a time.
+pub struct PinRing {
+    slots: Vec<PinSlot>,
+    cursor: usize,
+}
+
+impl PinRing {
+    /// Create a new ring with `k_ring` empty slots. Each slot's pinned
+    /// buffers are allocated lazily on first use.
+    pub fn new(k_ring: usize) -> Result<Self> {
+        assert!(k_ring >= 2, "kRing must be at least 2 for pipelining");
+        let slots = (0..k_ring)
+            .map(|_| {
+                Ok(PinSlot {
+                    buffers: Vec::new(),
+                    event: CuDFEvent::new()?,
+                    in_use: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { slots, cursor: 0 })
+    }
+
+    /// Number of slots in the ring.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the ring has zero slots (impossible per `new`'s assert,
+    /// but the method exists to satisfy clippy).
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Claim the next slot, copy `batch`'s buffers into freshly-pinned
+    /// host memory associated with that slot, and return a [`RecordBatch`]
+    /// backed by those pinned buffers.
+    ///
+    /// If the slot was used at least once before, this synchronizes on
+    /// the slot's event first — the only host-blocking operation in the
+    /// ring's hot path, and only when the host is racing ahead of the
+    /// GPU. After this call returns, the caller must consume the
+    /// returned `RecordBatch` (typically via `CuDFTable::from_arrow_host`)
+    /// and then call [`Self::record_h2d_event`] before the next
+    /// `fill_next`.
+    pub fn fill_next(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let slot = &mut self.slots[self.cursor];
+        if slot.in_use {
+            // Backpressure: only blocks if the GPU hasn't yet drained past
+            // this slot's last H2D. In steady state this is a no-op.
+            slot.event.synchronize()?;
+        }
+        // The previous batch's pinned `Arc`s drop here, going back to the
+        // global pool. The slot's event guarantees the corresponding H2D
+        // has retired, so the OS pages are safe to re-issue.
+        slot.buffers.clear();
+        let schema = batch.schema();
+        let arrays = batch
+            .columns()
+            .iter()
+            .map(|arr| pin_array_data(arr.to_data(), &mut slot.buffers).map(make_array))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(schema, arrays)?)
+    }
+
+    /// Record the just-filled slot's event on the CUDA default stream and
+    /// advance the ring cursor. Must be called after the H2D for the
+    /// `RecordBatch` returned by [`Self::fill_next`] has been queued
+    /// (e.g. inside `cuDF::from_arrow_host`).
+    pub fn record_h2d_event(&mut self) -> Result<()> {
+        let slot = &mut self.slots[self.cursor];
+        slot.event.record_on_default_stream()?;
+        slot.in_use = true;
+        self.cursor = (self.cursor + 1) % self.slots.len();
+        Ok(())
+    }
+}
+
+impl Drop for PinRing {
+    fn drop(&mut self) {
+        // Make sure any in-flight H2Ds reading from slot buffers have
+        // retired before the slot `Arc`s drop. Without this, dropping the
+        // ring while the GPU is still using a slot's source memory would
+        // race with the buffers' return to the global pool.
+        for slot in &self.slots {
+            if slot.in_use {
+                let _ = slot.event.synchronize();
+            }
+        }
     }
 }
 
@@ -320,6 +514,7 @@ mod tests {
 
         let pinned = pin_record_batch(batch)?;
         let out = pinned
+            .batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -339,6 +534,7 @@ mod tests {
 
         let pinned = pin_record_batch(batch)?;
         let out = pinned
+            .batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()

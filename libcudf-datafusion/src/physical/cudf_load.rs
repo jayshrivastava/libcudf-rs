@@ -18,10 +18,15 @@ use datafusion_physical_plan::{
     PlanProperties,
 };
 use futures_util::stream::StreamExt;
-use libcudf_rs::{is_cudf_array, pin_record_batch, synchronize_default_stream, CuDFTable};
+use libcudf_rs::{is_cudf_array, CuDFTable, PinRing};
 use std::any::Any;
 use std::fmt::Formatter;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Number of pinned-buffer slots in the per-LoadExec [`PinRing`]. The
+/// host may race up to `PIN_RING_SIZE - 1` batches ahead of the GPU's H2D
+/// engine before the next slot's wraparound sync engages backpressure.
+const PIN_RING_SIZE: usize = 3;
 
 #[derive(Debug)]
 pub struct CuDFLoadExec {
@@ -103,12 +108,19 @@ impl ExecutionPlan for CuDFLoadExec {
         // use a stream that allows each sender to put in at
         // least one result in an attempt to maximize
         // parallelism.
+        let pin_ring = if pinned_input {
+            Some(Arc::new(Mutex::new(
+                PinRing::new(PIN_RING_SIZE).map_err(cudf_to_df)?,
+            )))
+        } else {
+            None
+        };
         let mut builder = CuDFRecordBatchReceiverStreamBuilder {
             inner: RecordBatchReceiverStream::builder(self.schema(), input_partitions),
             ctx: CuDFRecordBatchReceiverStreamBuilderCtx {
                 schema: self.schema(),
                 metrics: CuDFBaselineMetrics::new(&self.metrics, partition),
-                pinned_input,
+                pin_ring,
             },
         };
 
@@ -137,7 +149,13 @@ struct CuDFRecordBatchReceiverStreamBuilder {
 struct CuDFRecordBatchReceiverStreamBuilderCtx {
     schema: SchemaRef,
     metrics: CuDFBaselineMetrics,
-    pinned_input: bool,
+    /// `Some` when `pinned_input` is enabled. Each input partition gets its
+    /// own ring; sharing across partitions is unnecessary because each
+    /// `run_input` call drives one logically-sequential batch loop.
+    /// Wrapped in `Arc<Mutex<...>>` so the per-batch `spawn_blocking`
+    /// closure can take a brief lock; batches are awaited sequentially
+    /// within a single `run_input`, so the lock is uncontested in practice.
+    pin_ring: Option<Arc<Mutex<PinRing>>>,
 }
 
 impl CuDFRecordBatchReceiverStreamBuilder {
@@ -174,11 +192,23 @@ impl CuDFRecordBatchReceiverStreamBuilder {
                     // failure path is the current safety net. Worth wiring through a
                     // `MemoryReservation` (try_grow / shrink per batch) if someone
                     // starts configuring per-query memory caps for cuDF operators.
-                    let table = if ctx.pinned_input {
-                        let pinned_batch = pin_record_batch(batch).map_err(cudf_to_df)?;
-                        let table =
-                            CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
-                        synchronize_default_stream().map_err(cudf_to_df)?;
+                    let table = if let Some(ring) = ctx.pin_ring.as_ref() {
+                        // Stage through the per-LoadExec pinned-buffer ring.
+                        // The ring caps in-flight H2Ds at `PIN_RING_SIZE`;
+                        // when this slot is reused (next time around), the
+                        // ring synchronizes on its event first, providing
+                        // backpressure without a per-batch host sync.
+                        let mut ring = ring
+                            .lock()
+                            .expect("PinRing mutex poisoned");
+                        let pinned_batch = ring.fill_next(batch).map_err(cudf_to_df)?;
+                        let table = CuDFTable::from_arrow_host(pinned_batch)
+                            .map_err(cudf_to_df)?;
+                        // Record the H2D event so the next slot wraparound
+                        // can synchronize on it. cuDF has already submitted
+                        // the cudaMemcpyAsync inside `from_arrow_host`, so
+                        // the event lands AFTER the H2D in the stream.
+                        ring.record_h2d_event().map_err(cudf_to_df)?;
                         table
                     } else {
                         CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?

@@ -4,14 +4,36 @@ use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_physical_plan::{execute_stream, ExecutionPlan};
 use futures_util::TryStreamExt;
 use libcudf_datafusion::aggregate::{avg, count, max, min, sum};
-use libcudf_datafusion::{configure_default_pools, SessionStateBuilderExt};
+use libcudf_datafusion::{configure_default_pools, CuDFConfig, SessionStateBuilderExt};
+use std::env;
 use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+
+fn target_partitions() -> usize {
+    env::var("CUDF_BENCH_TARGET_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+fn execution_batch_size() -> usize {
+    env::var("CUDF_BENCH_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65_536)
+}
+
+fn pinned_input() -> bool {
+    env::var("CUDF_BENCH_PINNED_INPUT")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true"))
+        .unwrap_or(true)
+}
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -22,7 +44,7 @@ fn schema() -> Arc<Schema> {
 
 fn make_batches(n: usize) -> Vec<RecordBatch> {
     let schema = schema();
-    let batch_size = 8192;
+    let batch_size = execution_batch_size();
     let mut batches = Vec::new();
     let mut offset = 0;
     while offset < n {
@@ -41,7 +63,10 @@ fn make_batches(n: usize) -> Vec<RecordBatch> {
 
 async fn cpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
     let schema = schema();
-    let ctx = SessionContext::new();
+    let cfg = SessionConfig::new()
+        .with_target_partitions(target_partitions())
+        .with_batch_size(execution_batch_size());
+    let ctx = SessionContext::new_with_config(cfg);
     ctx.register_table(
         "t",
         Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
@@ -52,8 +77,15 @@ async fn cpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
 
 async fn gpu_ctx(batches: Vec<RecordBatch>) -> SessionContext {
     let schema = schema();
+    let mut cudf_cfg = CuDFConfig::default();
+    cudf_cfg.pinned_input = pinned_input();
+    let cfg = SessionConfig::new()
+        .with_target_partitions(target_partitions())
+        .with_batch_size(execution_batch_size())
+        .with_option_extension(cudf_cfg);
     let state = SessionStateBuilder::new()
         .with_default_features()
+        .with_config(cfg)
         .with_cudf_planner()
         .build();
     let ctx = SessionContext::from(state);
@@ -84,7 +116,7 @@ fn bench_group(c: &mut Criterion, group_name: &str, sql: &str) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group(group_name);
 
-    for &n in &[1_000_000usize, 5_000_000, 20_000_000] {
+    for &n in &[1_000_000usize, 5_000_000, 20_000_000, 100_000_000] {
         group.throughput(Throughput::Elements(n as u64));
 
         let batches = make_batches(n);
