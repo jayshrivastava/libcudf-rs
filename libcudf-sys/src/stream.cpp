@@ -1,11 +1,14 @@
 #include "stream.h"
 
+#include <rmm/detail/error.hpp>
+
 #include <stdexcept>
 
 namespace libcudf_bridge {
     namespace {
         constexpr uint32_t kCudaStreamFlagSyncDefault = 0;
         constexpr uint32_t kCudaStreamFlagNonBlocking = 1;
+        constexpr uint32_t kCudaEventDisableTiming = 2;
 
         static_assert(
             static_cast<uint32_t>(rmm::cuda_stream::flags::sync_default) ==
@@ -13,6 +16,7 @@ namespace libcudf_bridge {
         static_assert(
             static_cast<uint32_t>(rmm::cuda_stream::flags::non_blocking) ==
             kCudaStreamFlagNonBlocking);
+        static_assert(cudaEventDisableTiming == kCudaEventDisableTiming);
 
         [[nodiscard]] rmm::cuda_stream::flags to_rmm_flags(const uint32_t flags) {
             return static_cast<rmm::cuda_stream::flags>(flags);
@@ -64,12 +68,56 @@ namespace libcudf_bridge {
         inner->synchronize();
     }
 
+    CudaEvent::CudaEvent(const uint32_t flags) {
+        RMM_CUDA_TRY(cudaEventCreateWithFlags(&inner, flags));
+    }
+
+    CudaEvent::~CudaEvent() {
+        if (inner != nullptr) {
+            cudaEventDestroy(inner);
+        }
+    }
+
+    void CudaEvent::record(const CudaStreamView& stream) const {
+        if (inner == nullptr) {
+            throw std::runtime_error("Cannot record null CUDA event");
+        }
+        RMM_CUDA_TRY(cudaEventRecord(inner, stream.inner.value()));
+    }
+
+    bool CudaEvent::query() const {
+        if (inner == nullptr) {
+            throw std::runtime_error("Cannot query null CUDA event");
+        }
+
+        const auto status = cudaEventQuery(inner);
+        if (status == cudaSuccess) {
+            return true;
+        }
+        if (status == cudaErrorNotReady) {
+            return false;
+        }
+        RMM_CUDA_TRY(status);
+        return false;
+    }
+
+    void CudaEvent::synchronize() const {
+        if (inner == nullptr) {
+            throw std::runtime_error("Cannot synchronize null CUDA event");
+        }
+        RMM_CUDA_TRY(cudaEventSynchronize(inner));
+    }
+
     std::unique_ptr<CudaStream> cuda_stream_create() {
         return std::make_unique<CudaStream>();
     }
 
     std::unique_ptr<CudaStream> cuda_stream_create_with_flags(const uint32_t flags) {
         return std::make_unique<CudaStream>(flags);
+    }
+
+    std::unique_ptr<CudaEvent> cuda_event_create_with_flags(const uint32_t flags) {
+        return std::make_unique<CudaEvent>(flags);
     }
 
     std::unique_ptr<CudaStreamView> cuda_stream_view(const CudaStream& stream) {

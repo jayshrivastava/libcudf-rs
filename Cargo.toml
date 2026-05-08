@@ -43,6 +43,7 @@ cxx = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 thiserror = { workspace = true }
+tokio = { version = "1.41", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 cuda-runtime-sys = "0.3.0-alpha.1"

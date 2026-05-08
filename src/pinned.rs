@@ -10,16 +10,33 @@
 //! `cudaMallocHost`, the driver can DMA directly from the source and the call
 //! is fully asynchronous.
 use crate::config::ensure_pools_configured;
-use crate::errors::Result;
+use crate::errors::{CuDFError, Result};
 use arrow::alloc::Allocation;
 use arrow::array::{make_array, ArrayData, ArrayDataBuilder, RecordBatch};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow::error::ArrowError;
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
-    cuda_default_stream_synchronize, get_pinned_memory_resource, HostDeviceAsyncResourceRef,
+    cuda_default_stream_synchronize, cuda_event_create_with_flags, get_default_stream,
+    get_pinned_memory_resource, CudaEvent, HostDeviceAsyncResourceRef,
 };
+use std::collections::VecDeque;
+use std::mem;
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{
+    self,
+    error::{SendError, TryRecvError},
+    UnboundedReceiver, UnboundedSender,
+};
+
+const PINNED_REAPER_ENV: &str = "LIBCUDF_PINNED_UPLOAD_REAPER";
+const GROUP_INTERVAL: Duration = Duration::from_millis(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_GROUP_BATCHES: usize = 32;
+const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 
 /// Process-global handle to cuDF's pinned MR. Lazily initialized once;
 /// thereafter every alloc/dealloc reads through the same `&'static` handle.
@@ -76,6 +93,186 @@ impl Drop for PinnedHostBuffer {
 pub fn synchronize_default_stream() -> Result<()> {
     cuda_default_stream_synchronize()?;
     Ok(())
+}
+
+/// Return whether pinned upload batches should be retained by the async reaper.
+pub fn pinned_upload_reaper_enabled() -> bool {
+    std::env::var(PINNED_REAPER_ENV).map_or(true, |v| v != "0")
+}
+
+/// Submit a pinned batch whose cuDF upload has already been enqueued.
+///
+/// The reaper keeps the batch's pinned host buffers alive until a CUDA event
+/// recorded after the upload completes.
+pub fn submit_uploaded_pinned_batch(batch: RecordBatch) -> Result<()> {
+    let reaper = match pinned_upload_reaper() {
+        Ok(reaper) => reaper,
+        Err(err) => {
+            synchronize_default_stream()?;
+            drop(batch);
+            return Err(err);
+        }
+    };
+
+    reaper.submit(batch)
+}
+
+fn pinned_upload_reaper() -> Result<&'static PinnedUploadReaper> {
+    static REAPER: OnceLock<PinnedUploadReaper> = OnceLock::new();
+
+    if let Some(reaper) = REAPER.get() {
+        return Ok(reaper);
+    }
+
+    let reaper = PinnedUploadReaper::try_spawn()?;
+    let _ = REAPER.set(reaper);
+    Ok(REAPER
+        .get()
+        .expect("pinned upload reaper should be initialized"))
+}
+
+struct PinnedUploadReaper {
+    tx: UnboundedSender<RecordBatch>,
+}
+
+impl PinnedUploadReaper {
+    fn try_spawn() -> Result<Self> {
+        let handle = Handle::try_current().map_err(|_| {
+            CuDFError::ArrowError(ArrowError::InvalidArgumentError(format!(
+                "{PINNED_REAPER_ENV}=1 requires an active Tokio runtime"
+            )))
+        })?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(handle.spawn(run_pinned_upload_reaper(rx)));
+        Ok(Self { tx })
+    }
+
+    fn submit(&self, batch: RecordBatch) -> Result<()> {
+        self.tx.send(batch).map_err(|err| {
+            synchronize_before_dropping_send_error(err);
+            CuDFError::ArrowError(ArrowError::InvalidArgumentError(
+                "pinned upload reaper task is not running".to_string(),
+            ))
+        })
+    }
+}
+
+struct SealedGroup {
+    batches: Vec<RecordBatch>,
+    event: UniquePtr<CudaEvent>,
+}
+
+async fn run_pinned_upload_reaper(mut rx: UnboundedReceiver<RecordBatch>) {
+    let mut open = Vec::<RecordBatch>::new();
+    let mut opened_at = Instant::now();
+    let mut sealed = VecDeque::<SealedGroup>::new();
+    let mut disconnected = false;
+
+    while !disconnected {
+        match tokio::time::timeout(POLL_INTERVAL, rx.recv()).await {
+            Ok(Some(batch)) => {
+                push_open_batch(&mut open, &mut opened_at, batch);
+                while open.len() < MAX_GROUP_BATCHES {
+                    match rx.try_recv() {
+                        Ok(batch) => push_open_batch(&mut open, &mut opened_at, batch),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(None) => disconnected = true,
+            Err(_) => {}
+        }
+
+        if open.len() >= MAX_GROUP_BATCHES {
+            seal_open_group_or_panic(&mut open, &mut opened_at, &mut sealed);
+        }
+
+        if !open.is_empty() && opened_at.elapsed() >= GROUP_INTERVAL {
+            seal_open_group_or_panic(&mut open, &mut opened_at, &mut sealed);
+        }
+
+        reap_completed_groups_or_panic(&mut sealed);
+    }
+
+    if !open.is_empty() {
+        seal_open_group_or_panic(&mut open, &mut opened_at, &mut sealed);
+    }
+
+    for group in sealed {
+        group.event.synchronize().unwrap_or_else(|err| {
+            panic!("synchronize upload event: {err}");
+        });
+        drop(group.batches);
+    }
+}
+
+fn push_open_batch(open: &mut Vec<RecordBatch>, opened_at: &mut Instant, batch: RecordBatch) {
+    if open.is_empty() {
+        *opened_at = Instant::now();
+    }
+    open.push(batch);
+}
+
+fn seal_open_group(
+    open: &mut Vec<RecordBatch>,
+    opened_at: &mut Instant,
+    sealed: &mut VecDeque<SealedGroup>,
+) -> Result<()> {
+    if open.is_empty() {
+        *opened_at = Instant::now();
+        return Ok(());
+    }
+
+    let stream = get_default_stream();
+    let event = cuda_event_create_with_flags(CUDA_EVENT_DISABLE_TIMING)?;
+    event.record(stream.as_ref().expect("default stream should not be null"))?;
+
+    sealed.push_back(SealedGroup {
+        batches: mem::take(open),
+        event,
+    });
+    *opened_at = Instant::now();
+    Ok(())
+}
+
+fn reap_completed_groups(sealed: &mut VecDeque<SealedGroup>) -> Result<usize> {
+    let mut completed = 0;
+    while let Some(group) = sealed.front() {
+        if !group.event.query()? {
+            break;
+        }
+        let _ = sealed.pop_front();
+        completed += 1;
+    }
+    Ok(completed)
+}
+
+fn seal_open_group_or_panic(
+    open: &mut Vec<RecordBatch>,
+    opened_at: &mut Instant,
+    sealed: &mut VecDeque<SealedGroup>,
+) {
+    seal_open_group(open, opened_at, sealed).unwrap_or_else(|err| {
+        let _ = synchronize_default_stream();
+        panic!("record upload event: {err}");
+    });
+}
+
+fn reap_completed_groups_or_panic(sealed: &mut VecDeque<SealedGroup>) {
+    reap_completed_groups(sealed).unwrap_or_else(|err| {
+        let _ = synchronize_default_stream();
+        panic!("query upload events: {err}");
+    });
+}
+
+fn synchronize_before_dropping_send_error(err: SendError<RecordBatch>) {
+    let SendError(batch) = err;
+    let _ = synchronize_default_stream();
+    drop(batch);
 }
 
 /// Return a copy of `batch` whose underlying buffers all live in pinned
@@ -166,6 +363,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
     use std::sync::Arc;
 
     #[test]
@@ -220,6 +418,61 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn submit_uploaded_pinned_batch_round_trips_nullable_batch(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+
+        rt.block_on(async {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let arr = Int64Array::from(vec![Some(11), None, Some(13), Some(17)]);
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])?;
+            let pinned = pin_record_batch(batch)?;
+
+            let table = crate::CuDFTable::from_arrow_host(pinned.clone())?;
+            submit_uploaded_pinned_batch(pinned)?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let output = table.into_view().to_arrow_host()?;
+            let out = output
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64Array");
+            assert_eq!(out.len(), 4);
+            assert_eq!(out.value(0), 11);
+            assert!(out.is_null(1));
+            assert_eq!(out.value(2), 13);
+            assert_eq!(out.value(3), 17);
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn push_open_batch_starts_group_interval_on_first_batch(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut open = Vec::new();
+        let mut opened_at = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("subtracting a minute from now should be valid");
+
+        push_open_batch(&mut open, &mut opened_at, empty_i64_batch()?);
+        assert_eq!(open.len(), 1);
+        assert!(opened_at.elapsed() < Duration::from_secs(1));
+
+        let first_opened_at = opened_at;
+        push_open_batch(&mut open, &mut opened_at, empty_i64_batch()?);
+        assert_eq!(open.len(), 2);
+        assert_eq!(opened_at, first_opened_at);
+
+        Ok(())
+    }
+
     /// `PinnedHostBuffer::Drop` must be safe to run during unwinding — a
     /// user `panic!` while a pinned batch is in flight should propagate
     /// cleanly without double-panic.
@@ -233,5 +486,11 @@ mod tests {
             result.is_err(),
             "outer panic should propagate to catch_unwind"
         );
+    }
+
+    fn empty_i64_batch() -> std::result::Result<RecordBatch, ArrowError> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let arr = Int64Array::from(Vec::<i64>::new());
+        RecordBatch::try_new(schema, vec![Arc::new(arr)])
     }
 }

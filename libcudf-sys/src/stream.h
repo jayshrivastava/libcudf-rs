@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <cudf/utilities/default_stream.hpp>
+#include <cuda_runtime_api.h>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -50,11 +51,36 @@ namespace libcudf_bridge {
         void synchronize() const;
     };
 
+    /// Owning wrapper for a CUDA event.
+    struct CudaEvent {
+        cudaEvent_t inner{};
+
+        /// Construct a CUDA event with explicit raw flag values.
+        explicit CudaEvent(uint32_t flags);
+
+        ~CudaEvent();
+
+        CudaEvent(CudaEvent const&) = delete;
+        CudaEvent& operator=(CudaEvent const&) = delete;
+
+        /// Record the event on the viewed CUDA stream.
+        void record(const CudaStreamView& stream) const;
+
+        /// Return true when all work before the event has completed.
+        [[nodiscard]] bool query() const;
+
+        /// Synchronize the event.
+        void synchronize() const;
+    };
+
     /// Create a CUDA stream using the default sync-default creation flag.
     std::unique_ptr<CudaStream> cuda_stream_create();
 
     /// Create a CUDA stream with an explicit raw flag value.
     std::unique_ptr<CudaStream> cuda_stream_create_with_flags(uint32_t flags);
+
+    /// Create a CUDA event with explicit raw flag values.
+    std::unique_ptr<CudaEvent> cuda_event_create_with_flags(uint32_t flags);
 
     /// Return a non-owning view for an owned CUDA stream.
     std::unique_ptr<CudaStreamView> cuda_stream_view(const CudaStream& stream);

@@ -16,7 +16,10 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures_util::stream::StreamExt;
-use libcudf_rs::{is_cudf_array, pin_record_batch, synchronize_default_stream, CuDFTable};
+use libcudf_rs::{
+    is_cudf_array, pin_record_batch, pinned_upload_reaper_enabled, submit_uploaded_pinned_batch,
+    synchronize_default_stream, CuDFTable,
+};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -166,12 +169,26 @@ impl CuDFRecordBatchReceiverStreamBuilder {
                 pin_timer.done();
 
                 let import_timer = ctx.metrics.import_time.timer();
-                let table = CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
-                import_timer.done();
+                let table = if pinned_upload_reaper_enabled() {
+                    let table =
+                        CuDFTable::from_arrow_host(pinned_batch.clone()).map_err(cudf_to_df)?;
+                    import_timer.done();
 
-                let sync_timer = ctx.metrics.sync_time.timer();
-                synchronize_default_stream().map_err(cudf_to_df)?;
-                sync_timer.done();
+                    let sync_timer = ctx.metrics.sync_time.timer();
+                    submit_uploaded_pinned_batch(pinned_batch).map_err(cudf_to_df)?;
+                    sync_timer.done();
+
+                    table
+                } else {
+                    let table = CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
+                    import_timer.done();
+
+                    let sync_timer = ctx.metrics.sync_time.timer();
+                    synchronize_default_stream().map_err(cudf_to_df)?;
+                    sync_timer.done();
+
+                    table
+                };
 
                 let output_batch_timer = ctx.metrics.output_batch_time.timer();
                 let num_rows = table.num_rows();

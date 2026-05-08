@@ -159,6 +159,9 @@ pub mod ffi {
         /// Opaque non-owning wrapper for an RMM CUDA stream view.
         type CudaStreamView;
 
+        /// Opaque owning wrapper for a CUDA event.
+        type CudaEvent;
+
         /// Return whether this wrapper still owns an underlying CUDA stream.
         ///
         /// In C++, you could do something like
@@ -183,6 +186,15 @@ pub mod ffi {
 
         /// Synchronize the viewed CUDA stream.
         fn synchronize(self: &CudaStreamView) -> Result<()>;
+
+        /// Record the event on a CUDA stream.
+        fn record(self: &CudaEvent, stream: &CudaStreamView) -> Result<()>;
+
+        /// Return true when all work before the event has completed.
+        fn query(self: &CudaEvent) -> Result<bool>;
+
+        /// Synchronize the event.
+        fn synchronize(self: &CudaEvent) -> Result<()>;
 
         /// Opaque non-owning wrapper for an RMM device async resource reference.
         type DeviceAsyncResourceRef;
@@ -815,6 +827,9 @@ pub mod ffi {
 
         /// Create a CUDA stream with explicit creation flags.
         fn cuda_stream_create_with_flags(flags: u32) -> Result<UniquePtr<CudaStream>>;
+
+        /// Create a CUDA event with explicit creation flags.
+        fn cuda_event_create_with_flags(flags: u32) -> Result<UniquePtr<CudaEvent>>;
 
         /// Return a non-owning view for an owned CUDA stream.
         fn cuda_stream_view(stream: &CudaStream) -> UniquePtr<CudaStreamView>;
@@ -1492,6 +1507,12 @@ unsafe impl Send for ffi::CudaStream {}
 /// SAFETY: Shared references to the opaque stream wrapper are safe.
 unsafe impl Sync for ffi::CudaStream {}
 
+/// SAFETY: CUDA event handles can be transferred between threads.
+unsafe impl Send for ffi::CudaEvent {}
+
+/// SAFETY: Shared references to the opaque event wrapper are safe.
+unsafe impl Sync for ffi::CudaEvent {}
+
 /// SAFETY: The cuda memory resource is a process-global allocator; the wrapper
 /// just owns its `unique_ptr` and is safe to move and share across threads.
 unsafe impl Send for ffi::CudaMemoryResource {}
@@ -1525,6 +1546,7 @@ mod tests {
 
     const CUDA_STREAM_FLAG_SYNC_DEFAULT: u32 = 0;
     const CUDA_STREAM_FLAG_NON_BLOCKING: u32 = 1;
+    const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
     // Sorting tests
     #[test]
     fn test_sort_table_ascending() -> Result<(), Box<dyn std::error::Error>> {
@@ -2123,6 +2145,20 @@ mod tests {
             assert!(default_view.is_default());
         }
         default_view.synchronize()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cuda_event_create_record_query_sync() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = ffi::cuda_stream_create()?;
+        let view = ffi::cuda_stream_view(stream.as_ref().expect("CudaStream should not be null"));
+        let event = ffi::cuda_event_create_with_flags(CUDA_EVENT_DISABLE_TIMING)?;
+
+        event.record(view.as_ref().expect("CudaStreamView should not be null"))?;
+        let _ = event.query()?;
+        event.synchronize()?;
+        assert!(event.query()?);
 
         Ok(())
     }
